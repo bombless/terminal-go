@@ -15,8 +15,10 @@
 
 - `go.mod` — Go module：`github.com/bombless/terminal-go`
 - `README.md` — 项目方向、目录与当前状态说明
-- `internal/term/screen.go` — 固定尺寸终端单元格缓冲区
-- `internal/term/vt.go` — 基础 ANSI/VT 解析器
+- `internal/term/screen.go` — 固定尺寸终端单元格缓冲区、擦除行/屏幕操作
+- `internal/term/vt.go` — 可跨 Feed 保留状态的基础 ANSI/VT 解析器，含 UTF-8 解码、光标移动、擦除与基础 SGR
+- `internal/term/screen_test.go` — 屏幕换行滚动、擦除与光标边界测试
+- `internal/term/vt_test.go` — 分段 CSI、分段 UTF-8、擦除与 SGR 回归测试
 - `internal/winapi/procs_windows.go` — Win32 DLL / procedure 动态绑定
 - `cmd/terminal/main.go` — Win32 GUI 窗口、GDI 绘制与消息循环
 
@@ -25,11 +27,11 @@
 **这是一个初始脚手架，不是可用的交互式终端。**
 
 - GUI 窗口与消息循环已搭建。
-- 屏幕缓冲区与少量 VT 指令解析已搭建。
+- 屏幕缓冲区与基础 VT 指令解析已搭建；解析器可处理跨多次 Feed 的 UTF-8 字符和 CSI 序列。
+- VT 当前覆盖光标相对移动/定位、擦除行/屏和基础 16 色 SGR 的部分指令；尚不完整。
 - 尚未创建 ConPTY，也未启动 PowerShell/CMD。
 - 尚未实现键盘输入、Shell 输出管道、窗口 resize。
-- VT 解析器目前只覆盖少数 CSI 指令；字节到 Unicode 的处理也不完整。
-- 尚未在 Windows 上用 GCCGO 实际编译或运行验证。
+- 尚未在 Windows 上用 GCCGO 实际编译或运行验证；本次改动也未执行 Go 测试。
 
 ## TODO 优先级
 
@@ -41,6 +43,8 @@
 - [ ] 如果 GCCGO 的 syscall 包不兼容，改为适合该工具链的纯 Go Win32 动态调用封装；不要引入 CGO。
 - [ ] 检查 Win32 结构体布局、字段对齐、指针宽度和调用约定，确保 32/64 位目标不会发生 ABI 错误。
 - [ ] 添加可重复的 Windows 构建脚本（PowerShell 或 Makefile），并在 README 中写清楚前置条件。
+
+> 阻塞说明：当前会话没有可执行的 Windows + GCCGO runner，也无法从 GitHub 连接器执行仓库构建。P0 仍未验证，不应仅凭源码推断 syscall API 或 Win32 ABI 正确。
 
 ### P1 — 完成最小可交互终端（ConPTY）
 
@@ -70,8 +74,8 @@
 
 ### P3 — 稳定性、兼容性与体验
 
-- [ ] 为 VT 解析器添加单元测试，覆盖跨多次 Feed 的分段转义序列。
-- [ ] 添加屏幕缓冲区滚动、边界、擦除和光标测试。
+- [x] 为 VT 解析器添加单元测试，覆盖跨多次 Feed 的分段转义序列。
+- [x] 添加屏幕缓冲区滚动、边界、擦除和光标测试。
 - [ ] 测试 PowerShell、CMD、常见 TUI 程序（例如编辑器、Git 交互命令）。
 - [ ] 处理窗口最小化、恢复、resize、快速输出和退出竞态。
 - [ ] 避免 UI 线程被管道读写阻塞。
@@ -90,10 +94,17 @@
 6. **先做可验证的垂直切片。** 优先达成“启动窗口 → ConPTY → 启动 PowerShell → 能输入命令并看到输出 → resize → 正常退出”，再扩展完整 VT 特性。
 7. **不要声称已通过编译或运行测试，除非确实在目标 Windows/GCCGO 环境执行过。**
 
+## 本次会话进展
+
+- 改进 VT 解析器：UTF-8 多字节字符可跨 Feed 解码；CSI 状态可跨 Feed 保留；补充光标相对移动、定位、擦除行/屏和更多基础 SGR。
+- 补充屏幕缓冲区擦除操作。
+- 新增 VT 与屏幕缓冲区回归测试。
+- 未执行 `go test`、Windows 构建或 GUI 运行；请在可用工具链上验证后再推进 P0。
+
 ## 建议下一会话的第一步
 
 1. 先读取仓库 `README.md`、`go.mod`、本文件和现有源文件，确认分支仍是 `feature/windows-terminal`。
-2. 先解决 P0：确定 GCCGO 目标工具链并验证 Win32 API 调用方式。
+2. 优先取得可复现的 MinGW-w64 GCCGO 工具链和 Windows runner，解决 P0 并运行新增测试。
 3. 检查当前 Win32 结构体与回调签名；修复 ABI/编译问题后再开始 ConPTY。
 4. 每完成一个可独立验证的阶段，提交小而清晰的 commit，并更新本文件的勾选状态。
 
