@@ -17,43 +17,25 @@ func NewScreen(width, height int) *Screen {
 	}
 	return s
 }
-
 func (s *Screen) blankCell() Cell { return Cell{Rune:' ', FG:s.FG, BG:s.BG} }
-
 func (s *Screen) Put(r rune) {
 	switch r {
 	case '\r': s.X = 0; return
-	case '\n':
-		s.Y++
-		if s.Y >= s.Height { s.scroll(); s.Y = s.Height-1 }
-		return
+	case '\n': s.Y++; if s.Y >= s.Height { s.scroll(); s.Y = s.Height-1 }; return
 	case '\b': if s.X > 0 { s.X-- }; return
-	case '\t':
-		s.X = (s.X/8+1)*8
-		if s.X >= s.Width { s.X = s.Width-1 }
-		return
+	case '\t': s.X = (s.X/8+1)*8; if s.X >= s.Width { s.X = s.Width-1 }; return
 	}
 	if r < 32 { return }
-	if s.X >= s.Width {
-		s.X = 0
-		s.Y++
-		if s.Y >= s.Height { s.scroll(); s.Y = s.Height-1 }
-	}
+	if s.X >= s.Width { s.X = 0; s.Y++; if s.Y >= s.Height { s.scroll(); s.Y = s.Height-1 } }
 	s.Cells[s.Y][s.X] = Cell{Rune:r, FG:s.FG, BG:s.BG}
 	s.X++
 }
-
-func (s *Screen) Clear() {
-	for y := range s.Cells { s.eraseRow(y, 0, s.Width-1) }
-	s.X, s.Y = 0, 0
-}
-
+func (s *Screen) Clear() { s.eraseDisplay(); s.X, s.Y = 0, 0 }
 func (s *Screen) Move(x, y int) {
 	if x < 0 { x = 0 }; if y < 0 { y = 0 }
 	if x >= s.Width { x = s.Width-1 }; if y >= s.Height { y = s.Height-1 }
 	s.X, s.Y = x, y
 }
-
 func (s *Screen) eraseRow(y, first, last int) {
 	if y < 0 || y >= s.Height { return }
 	if first < 0 { first = 0 }; if last >= s.Width { last = s.Width-1 }
@@ -62,6 +44,9 @@ func (s *Screen) eraseRow(y, first, last int) {
 func (s *Screen) eraseLine() { s.eraseRow(s.Y, 0, s.Width-1) }
 func (s *Screen) eraseLineFromCursor() { s.eraseRow(s.Y, s.X, s.Width-1) }
 func (s *Screen) eraseLineToCursor() { s.eraseRow(s.Y, 0, s.X) }
+func (s *Screen) eraseDisplay() {
+	for y := 0; y < s.Height; y++ { s.eraseRow(y, 0, s.Width-1) }
+}
 func (s *Screen) eraseDisplayFromCursor() {
 	s.eraseRow(s.Y, s.X, s.Width-1)
 	for y := s.Y+1; y < s.Height; y++ { s.eraseRow(y, 0, s.Width-1) }
