@@ -12,13 +12,8 @@ type Parser struct {
 	haveValue bool
 	text []byte
 }
-
 func NewParser(s *Screen) *Parser { return &Parser{screen:s} }
-
-func (p *Parser) Feed(data []byte) {
-	for _, b := range data { p.feedByte(b) }
-}
-
+func (p *Parser) Feed(data []byte) { for _, b := range data { p.feedByte(b) } }
 func (p *Parser) flushText(final bool) {
 	for len(p.text) > 0 {
 		if !utf8.FullRune(p.text) {
@@ -32,65 +27,44 @@ func (p *Parser) flushText(final bool) {
 		p.text = p.text[size:]
 	}
 }
-
 func (p *Parser) feedByte(b byte) {
 	if p.state == 0 {
-		if b == 0x1b {
-			p.flushText(true)
-			p.state = 1
-			return
-		}
-		if b >= 0x80 {
-			p.text = append(p.text, b)
-			p.flushText(false)
-			return
-		}
+		if b == 0x1b { p.flushText(true); p.state = 1; return }
+		if b >= 0x80 { p.text = append(p.text, b); p.flushText(false); return }
 		p.flushText(true)
 		p.screen.Put(rune(b))
 		return
 	}
-
 	switch p.state {
 	case 1:
 		if b == '[' {
 			p.state = 2
 			p.params = p.params[:0]
-			p.value = 0
-			p.haveValue = false
-		} else {
-			// Unsupported two-byte escape: consume it and return to ground.
-			p.state = 0
-		}
+			p.value, p.haveValue = 0, false
+		} else { p.state = 0 }
 	case 2:
 		switch {
 		case b >= '0' && b <= '9':
-			if p.value < 1000000 {
-				p.value = p.value*10 + int(b-'0')
-			}
+			if p.value < 1000000 { p.value = p.value*10 + int(b-'0') }
 			p.haveValue = true
-		case b == ';':
-			p.pushParam()
+		case b == ';': p.pushParam()
 		case b >= 0x40 && b <= 0x7e:
 			p.pushParam()
 			p.execute(b)
 			p.state = 0
 		default:
-			// Ignore unsupported intermediate/private bytes without losing
-			// the parser's ability to recover at the final CSI byte.
+			// Ignore unsupported intermediate/private bytes until the final byte.
 		}
 	}
 }
-
 func (p *Parser) pushParam() {
 	if p.haveValue { p.params = append(p.params, p.value) } else { p.params = append(p.params, 0) }
 	p.value, p.haveValue = 0, false
 }
-
 func (p *Parser) param(i, fallback int) int {
 	if i >= len(p.params) || p.params[i] == 0 { return fallback }
 	return p.params[i]
 }
-
 func (p *Parser) execute(final byte) {
 	s := p.screen
 	switch final {
@@ -103,7 +77,7 @@ func (p *Parser) execute(final byte) {
 		switch p.param(0, 0) {
 		case 0: s.eraseDisplayFromCursor()
 		case 1: s.eraseDisplayToCursor()
-		case 2, 3: s.Clear()
+		case 2, 3: s.eraseDisplay()
 		}
 	case 'K':
 		switch p.param(0, 0) {
