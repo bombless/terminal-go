@@ -38,6 +38,7 @@ const (
 	wmDestroy          = 0x0002
 	wmSize             = 0x0005
 	wmSetFocus         = 0x0007
+	wmKillFocus        = 0x0008
 	wmChar             = 0x0102
 	wmKeyDown          = 0x0100
 	wmCommand          = 0x0111
@@ -55,12 +56,14 @@ const (
 	colorWindow        = 5
 	swShow             = 5
 
-	idHost       = 1001
-	idConnect    = 1002
-	idDisconnect = 1003
-	idStatus     = 1004
-	enChange     = 0x0300
-	gcsCompStr   = 0x0008
+	idHost           = 1001
+	idConnect        = 1002
+	idDisconnect     = 1003
+	idStatus         = 1004
+	timerIDHeartbeat = 1
+	timerIDCursor    = 2
+	enChange         = 0x0300
+	gcsCompStr       = 0x0008
 
 	cellWidth     = 10
 	cellHeight    = 20
@@ -108,6 +111,7 @@ type textSelection struct {
 var (
 	className                                              = syscall.StringToUTF16Ptr("TerminalGoWindow")
 	windowTitle                                            = syscall.StringToUTF16Ptr("terminal-go - SSH Terminal")
+	mainHwnd                                               uintptr
 	hostEdit, connectButton, disconnectButton, statusLabel uintptr
 	screenMu                                               sync.Mutex
 	screen                                                 = term.NewScreen(96, 30)
@@ -117,6 +121,9 @@ var (
 	session                                                *sshclient.Session
 	inputQueue                                             = make(chan pendingInput, 256)
 	selection                                              textSelection
+	cursorBlinkOn                                                 = true
+	cursorBlinkInterval                                    uint32 = 530
+	lastCursorRc                                           rect
 	telemetry                                              *log.Logger
 	telemetryFile                                          *os.File
 	paintFrames                                            uint64
@@ -152,6 +159,48 @@ func telemetryf(format string, args ...any) {
 	}
 }
 
+func cursorCellRect(curX, curY int) rect {
+	cLeft := int32(12 + curX*cellWidth)
+	cTop := int32(toolbarHeight + 6 + curY*cellHeight)
+	return rect{
+		Left:   cLeft,
+		Top:    cTop,
+		Right:  cLeft + cellWidth,
+		Bottom: cTop + cellHeight,
+	}
+}
+
+func invalidateCursor(hwnd uintptr) {
+	screenMu.Lock()
+	curX, curY := screen.X, screen.Y
+	screenMu.Unlock()
+	if curX >= screen.Width {
+		curX = screen.Width - 1
+	}
+	if curY >= screen.Height {
+		curY = screen.Height - 1
+	}
+	if curX >= 0 && curY >= 0 {
+		rc := cursorCellRect(curX, curY)
+		if lastCursorRc != rc && lastCursorRc.Right > lastCursorRc.Left {
+			winapi.User32.NewProc("InvalidateRect").Call(hwnd, uintptr(unsafe.Pointer(&lastCursorRc)), 0)
+		}
+		lastCursorRc = rc
+		winapi.User32.NewProc("InvalidateRect").Call(hwnd, uintptr(unsafe.Pointer(&rc)), 0)
+	} else if lastCursorRc.Right > lastCursorRc.Left {
+		winapi.User32.NewProc("InvalidateRect").Call(hwnd, uintptr(unsafe.Pointer(&lastCursorRc)), 0)
+		lastCursorRc = rect{}
+	}
+}
+
+func resetCursorBlink(hwnd uintptr) {
+	cursorBlinkOn = true
+	if cursorBlinkInterval > 0 {
+		winapi.User32.NewProc("SetTimer").Call(hwnd, timerIDCursor, uintptr(cursorBlinkInterval), 0)
+	}
+	invalidateCursor(hwnd)
+}
+
 func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 	switch message {
 	case wmCreate:
@@ -160,9 +209,22 @@ func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 		terminalFont, _, _ = winapi.CreateFontW.Call(^uintptr(15), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0x31, uintptr(unsafe.Pointer(fontName)))
 		toolbarBrush, _, _ = winapi.CreateSolidBrush.Call(0x001E1E1E)
 		createToolbar(hwnd)
-		winapi.User32.NewProc("SetTimer").Call(hwnd, 1, 1000, 0)
+		winapi.User32.NewProc("SetTimer").Call(hwnd, timerIDHeartbeat, 1000, 0)
+		blinkTime, _, _ := winapi.User32.NewProc("GetCaretBlinkTime").Call()
+		if blinkTime == 0 || blinkTime > 2000 {
+			blinkTime = 530
+		}
+		cursorBlinkInterval = uint32(blinkTime)
+		winapi.User32.NewProc("SetTimer").Call(hwnd, timerIDCursor, uintptr(cursorBlinkInterval), 0)
 		lastHeartbeat = time.Now()
 		telemetryf("window_message wm_create_end host=%d connect=%d disconnect=%d status=%d", hostEdit, connectButton, disconnectButton, statusLabel)
+		return 0
+	case wmSetFocus:
+		resetCursorBlink(hwnd)
+		return 0
+	case wmKillFocus:
+		cursorBlinkOn = false
+		invalidateCursor(hwnd)
 		return 0
 	case wmSize:
 		telemetryf("window_message wm_size_begin width=%d height=%d", uint16(lParam), uint16(lParam>>16))
@@ -175,6 +237,8 @@ func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 		if py < toolbarHeight {
 			return 0
 		}
+		winapi.User32.NewProc("SetFocus").Call(hwnd)
+		resetCursorBlink(hwnd)
 		x, y := mouseCell(lParam)
 		selection = textSelection{start: y*screen.Width + x, end: y*screen.Width + x, active: true, dragging: true}
 		winapi.User32.NewProc("SetCapture").Call(hwnd)
@@ -223,6 +287,7 @@ func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 		r, _, _ := winapi.DefWindowProcW.Call(hwnd, uintptr(message), wParam, lParam)
 		return r
 	case wmChar:
+		resetCursorBlink(hwnd)
 		if wParam == 3 {
 			if selection.active && selection.start != selection.end {
 				copySelection()
@@ -246,6 +311,7 @@ func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 		}
 		return 0
 	case wmKeyDown:
+		resetCursorBlink(hwnd)
 		if keyDown(vkControl) {
 			switch wParam {
 			case 'C':
@@ -276,14 +342,27 @@ func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 		winapi.SetBkColor.Call(hdc, 0x001E1E1E)
 		return toolbarBrush
 	case wmTimer:
-		if time.Since(lastHeartbeat) >= 5*time.Second {
-			hostLength, _, _ := winapi.User32.NewProc("GetWindowTextLengthW").Call(hostEdit)
-			telemetryf("ui_heartbeat message_loop_alive host_length=%d input_queue=%d", hostLength, len(inputQueue))
-			lastHeartbeat = time.Now()
+		switch wParam {
+		case timerIDHeartbeat:
+			if time.Since(lastHeartbeat) >= 5*time.Second {
+				hostLength, _, _ := winapi.User32.NewProc("GetWindowTextLengthW").Call(hostEdit)
+				telemetryf("ui_heartbeat message_loop_alive host_length=%d input_queue=%d", hostLength, len(inputQueue))
+				lastHeartbeat = time.Now()
+			}
+			return 0
+		case timerIDCursor:
+			focused, _, _ := winapi.User32.NewProc("GetFocus").Call()
+			if focused == hwnd {
+				cursorBlinkOn = !cursorBlinkOn
+				invalidateCursor(hwnd)
+			}
+			return 0
 		}
 		return 0
 	case wmDestroy:
 		disconnectSSH("Window closed")
+		winapi.User32.NewProc("KillTimer").Call(hwnd, timerIDHeartbeat)
+		winapi.User32.NewProc("KillTimer").Call(hwnd, timerIDCursor)
 		if terminalFont != 0 {
 			winapi.DeleteObject.Call(terminalFont)
 			terminalFont = 0
@@ -545,6 +624,7 @@ func connectSSH(hwnd uintptr) {
 	sessionMu.Unlock()
 	setStatus("Connected: " + host)
 	winapi.User32.NewProc("SetFocus").Call(hwnd)
+	resetCursorBlink(hwnd)
 	go readSessionOutput(s, hwnd)
 }
 
@@ -560,6 +640,7 @@ func readSessionOutput(s *sshclient.Session, hwnd uintptr) {
 			screenMu.Lock()
 			parser.Feed(buf[:n])
 			screenMu.Unlock()
+			cursorBlinkOn = true
 			parseElapsed := time.Since(parseStart)
 			windowBytes += int64(n)
 			windowChunks++
@@ -600,6 +681,7 @@ func readSessionOutput(s *sshclient.Session, hwnd uintptr) {
 		telemetryf("ssh_exit code=%d", code)
 		setStatus(fmt.Sprintf("SSH exited (%d)", code))
 	}
+	winapi.User32.NewProc("InvalidateRect").Call(hwnd, 0, 0)
 }
 
 func writeInput(data []byte) {
@@ -662,6 +744,9 @@ func disconnectSSH(status string) {
 	sessionMu.Unlock()
 	if s != nil {
 		go func() { inputWriteMu.Lock(); _ = s.Close(); inputWriteMu.Unlock() }()
+	}
+	if mainHwnd != 0 {
+		winapi.User32.NewProc("InvalidateRect").Call(mainHwnd, 0, 0)
 	}
 	setStatus(status)
 }
@@ -787,14 +872,30 @@ func paint(hwnd uintptr) {
 		}
 	}
 	curX, curY := screen.X, screen.Y
+	cursorVisible := screen.CursorVisible
 	screenMu.Unlock()
-	if curX >= 0 && curX < screen.Width && curY >= 0 && curY < screen.Height {
+	sessionMu.Lock()
+	hasSession := session != nil
+	sessionMu.Unlock()
+	focused, _, _ := winapi.User32.NewProc("GetFocus").Call()
+	isFocused := focused == hwnd
+
+	if curX >= screen.Width {
+		curX = screen.Width - 1
+	}
+	if curY >= screen.Height {
+		curY = screen.Height - 1
+	}
+
+	showCursor := hasSession && cursorVisible && ((isFocused && cursorBlinkOn) || (!isFocused && true))
+	if showCursor && curX >= 0 && curY >= 0 {
 		cLeft := int32(12 + curX*cellWidth)
 		cTop := int32(toolbarHeight + 6 + curY*cellHeight)
 		cursorRc := rect{Left: cLeft, Top: cTop, Right: cLeft + cellWidth, Bottom: cTop + cellHeight}
 		cursorBrush, _, _ := winapi.CreateSolidBrush.Call(0x00A0A0A0)
 		winapi.FrameRect.Call(hdc, uintptr(unsafe.Pointer(&cursorRc)), cursorBrush)
 		winapi.DeleteObject.Call(cursorBrush)
+		lastCursorRc = cursorRc
 	}
 	if previousFont != 0 {
 		winapi.SelectObject.Call(hdc, previousFont)
@@ -867,6 +968,7 @@ func main() {
 		telemetryf("main create_window_failed err=%v", e)
 		panic(e)
 	}
+	mainHwnd = hwnd
 	telemetryf("main after_create_window hwnd=%d", hwnd)
 	winapi.User32.NewProc("ShowWindow").Call(hwnd, swShow)
 	telemetryf("main after_show_window")

@@ -12,6 +12,7 @@ type Screen struct {
 	Cells         [][]Cell
 	X, Y          int
 	FG, BG        uint32
+	CursorVisible bool
 }
 
 func NewScreen(width, height int) *Screen {
@@ -21,7 +22,7 @@ func NewScreen(width, height int) *Screen {
 	if height < 1 {
 		height = 25
 	}
-	s := &Screen{Width: width, Height: height, FG: 7, BG: 0}
+	s := &Screen{Width: width, Height: height, FG: 7, BG: 0, CursorVisible: true}
 	s.Cells = make([][]Cell, height)
 	for y := range s.Cells {
 		s.Cells[y] = make([]Cell, width)

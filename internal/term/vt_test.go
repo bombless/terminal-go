@@ -87,3 +87,19 @@ func TestParserSaveRestoreCursorAndResetColors(t *testing.T) {
 		t.Fatalf("reset cell = %+v, want Y with default colors", got)
 	}
 }
+
+func TestParserDECTCEMCursorVisibility(t *testing.T) {
+	s := NewScreen(8, 2)
+	p := NewParser(s)
+	if !s.CursorVisible {
+		t.Fatal("CursorVisible should default to true")
+	}
+	p.Feed([]byte("\x1b[?25l"))
+	if s.CursorVisible {
+		t.Fatal("CursorVisible should be false after DECRST 25")
+	}
+	p.Feed([]byte("\x1b[?25h"))
+	if !s.CursorVisible {
+		t.Fatal("CursorVisible should be true after DECSET 25")
+	}
+}

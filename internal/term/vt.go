@@ -107,6 +107,8 @@ func (p *Parser) feedByte(b byte) {
 			p.pushParam()
 			if !p.private {
 				p.execute(b)
+			} else {
+				p.executePrivate(b)
 			}
 			p.state = stateGround
 		case b == 0x1b:
@@ -189,6 +191,23 @@ func (p *Parser) execute(final byte) {
 		p.savedX, p.savedY = s.X, s.Y
 	case 'u':
 		s.Move(p.savedX, p.savedY)
+	}
+}
+
+func (p *Parser) executePrivate(final byte) {
+	switch final {
+	case 'h': // DECSET
+		for _, param := range p.params {
+			if param == 25 {
+				p.screen.CursorVisible = true
+			}
+		}
+	case 'l': // DECRST
+		for _, param := range p.params {
+			if param == 25 {
+				p.screen.CursorVisible = false
+			}
+		}
 	}
 }
 
