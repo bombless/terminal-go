@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -24,6 +25,7 @@ const (
 	csVRedraw          = 0x0001
 	csHRedraw          = 0x0002
 	wsOverlappedWindow = 0x00CF0000
+	wsClipChildren     = 0x02000000
 	wsVisible          = 0x10000000
 	wsChild            = 0x40000000
 	wsBorder           = 0x00800000
@@ -40,6 +42,7 @@ const (
 	wmCommand          = 0x0111
 	wmTimer            = 0x0113
 	wmPaint            = 0x000F
+	wmCtlColorStatic   = 0x0138
 	wmMouseMove        = 0x0200
 	wmLButtonDown      = 0x0201
 	wmLButtonUp        = 0x0202
@@ -60,6 +63,8 @@ const (
 	cellWidth     = 10
 	cellHeight    = 20
 	toolbarHeight = 48
+	selectionBG   = 0x01A56E2B // Tagged RGB: #A56E2B.
+	selectionFG   = 0x01FFFFFF // Tagged RGB: #FFFFFF.
 )
 
 type point struct{ X, Y int32 }
@@ -115,6 +120,8 @@ var (
 	paintFrames                                            uint64
 	lastSlowPaint                                          time.Time
 	lastHeartbeat                                          time.Time
+	terminalFont                                           uintptr
+	toolbarBrush                                           uintptr
 )
 
 func initTelemetry() {
@@ -147,6 +154,9 @@ func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 	switch message {
 	case wmCreate:
 		telemetryf("window_message wm_create_begin")
+		fontName := syscall.StringToUTF16Ptr("Consolas")
+		terminalFont, _, _ = winapi.CreateFontW.Call(^uintptr(15), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0x31, uintptr(unsafe.Pointer(fontName)))
+		toolbarBrush, _, _ = winapi.CreateSolidBrush.Call(0x001E1E1E)
 		createToolbar(hwnd)
 		winapi.User32.NewProc("SetTimer").Call(hwnd, 1, 1000, 0)
 		lastHeartbeat = time.Now()
@@ -159,6 +169,10 @@ func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 		telemetryf("window_message wm_size_end")
 		return 0
 	case wmLButtonDown:
+		py := int32(int16(uint16(lParam >> 16)))
+		if py < toolbarHeight {
+			return 0
+		}
 		x, y := mouseCell(lParam)
 		selection = textSelection{start: y*screen.Width + x, end: y*screen.Width + x, active: true, dragging: true}
 		winapi.User32.NewProc("SetCapture").Call(hwnd)
@@ -195,6 +209,15 @@ func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 		defer telemetryf("wm_command_end control_id=%d notify_code=%d", controlID, notifyCode)
 		if controlID == idHost && notifyCode == enChange {
 			telemetryf("host_edit_change length=%d", hostLength)
+			// The native EDIT control has already applied the change. Consume its
+			// notifications here instead of forwarding child-control WM_COMMAND
+			// messages to the parent window's default procedure.
+			return 0
+		}
+		if controlID == idHost {
+			// Focus/update notifications from the EDIT control need no parent
+			// default processing either.
+			return 0
 		}
 		switch controlID {
 		case idConnect:
@@ -259,6 +282,11 @@ func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 		paint(hwnd)
 		telemetryf("window_message wm_paint_end")
 		return 0
+	case wmCtlColorStatic:
+		hdc := wParam
+		winapi.SetTextColor.Call(hdc, 0x00D0D0D0)
+		winapi.SetBkColor.Call(hdc, 0x001E1E1E)
+		return toolbarBrush
 	case wmTimer:
 		if time.Since(lastHeartbeat) >= 5*time.Second {
 			hostLength, _, _ := winapi.User32.NewProc("GetWindowTextLengthW").Call(hostEdit)
@@ -268,6 +296,14 @@ func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 		return 0
 	case wmDestroy:
 		disconnectSSH("Window closed")
+		if terminalFont != 0 {
+			winapi.DeleteObject.Call(terminalFont)
+			terminalFont = 0
+		}
+		if toolbarBrush != 0 {
+			winapi.DeleteObject.Call(toolbarBrush)
+			toolbarBrush = 0
+		}
 		winapi.PostQuitMessage.Call(0)
 		return 0
 	}
@@ -460,6 +496,8 @@ func setStatus(value string) {
 		p, err := syscall.UTF16PtrFromString(value)
 		if err == nil {
 			winapi.User32.NewProc("SetWindowTextW").Call(statusLabel, uintptr(unsafe.Pointer(p)))
+			winapi.User32.NewProc("InvalidateRect").Call(statusLabel, 0, 1)
+			winapi.User32.NewProc("UpdateWindow").Call(statusLabel)
 		}
 	}
 }
@@ -482,7 +520,7 @@ func connectSSH(hwnd uintptr) {
 		setStatus("Enter user@host or host")
 		return
 	}
-	setStatus("Starting SSH...")
+	setStatus("Connecting to " + host + "...")
 	resolveStarted := time.Now()
 	executable, err := sshclient.ResolveExecutable("")
 	telemetryf("ssh_resolve duration=%s err=%v", time.Since(resolveStarted), err)
@@ -492,7 +530,18 @@ func connectSSH(hwnd uintptr) {
 		return
 	}
 	spawnStarted := time.Now()
-	s, err := sshclient.Start(executable, []string{host}, screen.Width, screen.Height)
+	var sshArgs []string
+	cleanHost := host
+	if lastColon := strings.LastIndex(host, ":"); lastColon != -1 && !strings.Contains(host[lastColon:], "]") {
+		portPart := host[lastColon+1:]
+		if portNum, err := strconv.Atoi(portPart); err == nil && portNum > 0 && portNum <= 65535 {
+			sshArgs = append(sshArgs, "-p", portPart)
+			cleanHost = host[:lastColon]
+		}
+	}
+	sshArgs = append(sshArgs, cleanHost)
+
+	s, err := sshclient.Start(executable, sshArgs, screen.Width, screen.Height)
 	telemetryf("ssh_spawn duration=%s err=%v total=%s", time.Since(spawnStarted), err, time.Since(connectStarted))
 	if err != nil {
 		setStatus("Connect failed: " + err.Error())
@@ -691,22 +740,27 @@ func paint(hwnd uintptr) {
 	var rc rect
 	winapi.GetClientRect.Call(hwnd, uintptr(unsafe.Pointer(&rc)))
 	brush, _, _ := winapi.CreateSolidBrush.Call(0x001E1E1E)
-	winapi.FillRect.Call(hdc, uintptr(unsafe.Pointer(&rc)), brush)
+	termRect := rect{Left: 0, Top: toolbarHeight, Right: rc.Right, Bottom: rc.Bottom}
+	winapi.FillRect.Call(hdc, uintptr(unsafe.Pointer(&termRect)), brush)
 	winapi.DeleteObject.Call(brush)
 	winapi.SetBkMode.Call(hdc, 1)
+	var previousFont uintptr
+	if terminalFont != 0 {
+		previousFont, _, _ = winapi.SelectObject.Call(hdc, terminalFont)
+	}
 	screenMu.Lock()
 	for y := 0; y < screen.Height; y++ {
 		for x := 0; x < screen.Width; {
 			cell := screen.Cells[y][x]
 			selected := selection.active && isSelected(y*screen.Width+x)
 			if selected {
-				cell.BG, cell.FG = 0x00A56E2B, 0x00FFFFFF
+				cell.BG, cell.FG = selectionBG, selectionFG
 			}
 			end := x + 1
 			for end < screen.Width {
 				next := screen.Cells[y][end]
 				if selection.active && isSelected(y*screen.Width+end) {
-					next.BG, next.FG = 0x00A56E2B, 0x00FFFFFF
+					next.BG, next.FG = selectionBG, selectionFG
 				}
 				if next.FG != cell.FG || next.BG != cell.BG {
 					break
@@ -733,11 +787,30 @@ func paint(hwnd uintptr) {
 				line[i-x] = uint16(r)
 			}
 			winapi.SetTextColor.Call(hdc, uintptr(colorRef(cell.FG)))
-			winapi.TextOutW.Call(hdc, uintptr(left), uintptr(top), uintptr(unsafe.Pointer(&line[0])), uintptr(len(line)))
+			// Explicit advances keep every glyph on the fixed terminal-cell grid.
+			dx := make([]int32, len(line))
+			for i := range dx {
+				dx[i] = cellWidth
+			}
+			winapi.ExtTextOutW.Call(hdc, uintptr(left), uintptr(top), 0x0004,
+				uintptr(unsafe.Pointer(&background)), uintptr(unsafe.Pointer(&line[0])),
+				uintptr(len(line)), uintptr(unsafe.Pointer(&dx[0])))
 			x = end
 		}
 	}
+	curX, curY := screen.X, screen.Y
 	screenMu.Unlock()
+	if curX >= 0 && curX < screen.Width && curY >= 0 && curY < screen.Height {
+		cLeft := int32(12 + curX*cellWidth)
+		cTop := int32(toolbarHeight + 6 + curY*cellHeight)
+		cursorRc := rect{Left: cLeft, Top: cTop, Right: cLeft + cellWidth, Bottom: cTop + cellHeight}
+		cursorBrush, _, _ := winapi.CreateSolidBrush.Call(0x00A0A0A0)
+		winapi.FrameRect.Call(hdc, uintptr(unsafe.Pointer(&cursorRc)), cursorBrush)
+		winapi.DeleteObject.Call(cursorBrush)
+	}
+	if previousFont != 0 {
+		winapi.SelectObject.Call(hdc, previousFont)
+	}
 	winapi.EndPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
 	elapsed := time.Since(paintStarted)
 	paintFrames++
@@ -759,23 +832,7 @@ func isSelected(position int) bool {
 
 // colorRef converts an ANSI palette index or tagged 24-bit RGB value to GDI COLORREF.
 func colorRef(color uint32) uint32 {
-	if color&0xFF000000 != 0 {
-		rgb := color & 0xFFFFFF
-		return (rgb&0xFF)<<16 | (rgb & 0xFF00) | (rgb>>16)&0xFF
-	}
-	base := [...]uint32{0x000000, 0xCD0000, 0x00CD00, 0xCDCD00, 0x0000EE, 0xCD00CD, 0x00CDCD, 0xE5E5E5, 0x7F7F7F, 0xFF0000, 0x00FF00, 0xFFFF00, 0x5C5CFF, 0xFF00FF, 0x00FFFF, 0xFFFFFF}
-	var rgb uint32
-	if color < 16 {
-		rgb = base[color]
-	} else if color < 232 {
-		n := color - 16
-		levels := [...]uint32{0, 95, 135, 175, 215, 255}
-		rgb = levels[n/36]<<16 | levels[(n/6)%6]<<8 | levels[n%6]
-	} else if color < 256 {
-		v := uint32(8 + (color-232)*10)
-		rgb = v<<16 | v<<8 | v
-	}
-	return (rgb&0xFF)<<16 | (rgb & 0xFF00) | (rgb>>16)&0xFF
+	return term.ColorRef(color)
 }
 
 func main() {
@@ -799,7 +856,7 @@ func main() {
 	}
 	telemetryf("main after_register_class")
 	telemetryf("main before_create_window")
-	hwnd, _, e := winapi.CreateWindowExW.Call(0, uintptr(unsafe.Pointer(className)), uintptr(unsafe.Pointer(windowTitle)), wsOverlappedWindow|wsVisible, 100, 100, 1100, 720, 0, 0, instance, 0)
+	hwnd, _, e := winapi.CreateWindowExW.Call(0, uintptr(unsafe.Pointer(className)), uintptr(unsafe.Pointer(windowTitle)), wsOverlappedWindow|wsClipChildren|wsVisible, 100, 100, 1100, 720, 0, 0, instance, 0)
 	if hwnd == 0 {
 		telemetryf("main create_window_failed err=%v", e)
 		panic(e)
@@ -814,6 +871,13 @@ func main() {
 		r, _, _ := winapi.GetMessageW.Call(uintptr(unsafe.Pointer(&m)), 0, 0, 0)
 		if int32(r) <= 0 {
 			break
+		}
+		if m.Message == wmKeyDown && m.WParam == 0x0D { // VK_RETURN
+			focus, _, _ := winapi.User32.NewProc("GetFocus").Call()
+			if focus == hostEdit {
+				connectSSH(hwnd)
+				continue
+			}
 		}
 		winapi.TranslateMessage.Call(uintptr(unsafe.Pointer(&m)))
 		winapi.DispatchMessageW.Call(uintptr(unsafe.Pointer(&m)))

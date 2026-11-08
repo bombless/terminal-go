@@ -21,10 +21,15 @@ var (
 	FillRect         = User32.NewProc("FillRect")
 	GetClientRect    = User32.NewProc("GetClientRect")
 	TextOutW         = Gdi32.NewProc("TextOutW")
+	ExtTextOutW      = Gdi32.NewProc("ExtTextOutW")
+	SelectObject     = Gdi32.NewProc("SelectObject")
+	CreateFontW      = Gdi32.NewProc("CreateFontW")
 	CreateSolidBrush = Gdi32.NewProc("CreateSolidBrush")
 	DeleteObject     = Gdi32.NewProc("DeleteObject")
 	SetTextColor     = Gdi32.NewProc("SetTextColor")
+	SetBkColor       = Gdi32.NewProc("SetBkColor")
 	SetBkMode        = Gdi32.NewProc("SetBkMode")
+	FrameRect        = User32.NewProc("FrameRect")
 
 	// ConPTY and process APIs are exported by Kernel32 on supported Windows versions.
 	CreatePseudoConsole               = Kernel32.NewProc("CreatePseudoConsole")
