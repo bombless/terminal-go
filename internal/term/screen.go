@@ -3,7 +3,7 @@ package term
 // Cell is one terminal character cell.
 type Cell struct {
 	Rune   rune
-	FG, BG uint8
+	FG, BG uint32
 }
 
 // Screen stores a fixed-size terminal grid.
@@ -11,7 +11,7 @@ type Screen struct {
 	Width, Height int
 	Cells         [][]Cell
 	X, Y          int
-	FG, BG        uint8
+	FG, BG        uint32
 }
 
 func NewScreen(width, height int) *Screen {

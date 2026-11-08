@@ -376,26 +376,59 @@ func paint(hwnd uintptr) {
 	winapi.FillRect.Call(hdc, uintptr(unsafe.Pointer(&rc)), brush)
 	winapi.DeleteObject.Call(brush)
 	winapi.SetBkMode.Call(hdc, 1)
-	winapi.SetTextColor.Call(hdc, 0x00D4D4D4)
 	screenMu.Lock()
 	for y := 0; y < screen.Height; y++ {
-		line := make([]uint16, screen.Width)
-		for x := 0; x < screen.Width; x++ {
-			r := screen.Cells[y][x].Rune
-			if r == 0 {
-				r = ' '
+		for x := 0; x < screen.Width; {
+			cell := screen.Cells[y][x]
+			end := x + 1
+			for end < screen.Width && screen.Cells[y][end].FG == cell.FG && screen.Cells[y][end].BG == cell.BG {
+				end++
 			}
-			if r > 0xFFFF {
-				r = '?'
+			left := int32(12 + x*cellWidth)
+			top := int32(toolbarHeight + 6 + y*cellHeight)
+			background := rect{Left: left, Top: top, Right: left + int32((end-x)*cellWidth), Bottom: top + cellHeight}
+			cellBrush, _, _ := winapi.CreateSolidBrush.Call(uintptr(colorRef(cell.BG)))
+			winapi.FillRect.Call(hdc, uintptr(unsafe.Pointer(&background)), cellBrush)
+			winapi.DeleteObject.Call(cellBrush)
+			line := make([]uint16, end-x)
+			for i := x; i < end; i++ {
+				r := screen.Cells[y][i].Rune
+				if r == 0 {
+					r = ' '
+				}
+				if r > 0xFFFF {
+					r = '?'
+				}
+				line[i-x] = uint16(r)
 			}
-			line[x] = uint16(r)
-		}
-		if len(line) > 0 {
-			winapi.TextOutW.Call(hdc, 12, uintptr(toolbarHeight+6+y*cellHeight), uintptr(unsafe.Pointer(&line[0])), uintptr(len(line)))
+			winapi.SetTextColor.Call(hdc, uintptr(colorRef(cell.FG)))
+			winapi.TextOutW.Call(hdc, uintptr(left), uintptr(top), uintptr(unsafe.Pointer(&line[0])), uintptr(len(line)))
+			x = end
 		}
 	}
 	screenMu.Unlock()
 	winapi.EndPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
+}
+
+// colorRef converts an ANSI palette index or tagged 24-bit RGB value to GDI COLORREF.
+func colorRef(color uint32) uint32 {
+	if color&0xFF000000 != 0 {
+		rgb := color & 0xFFFFFF
+		return (rgb&0xFF)<<16 | (rgb & 0xFF00) | (rgb>>16)&0xFF
+	}
+	base := [...]uint32{0x000000, 0xCD0000, 0x00CD00, 0xCDCD00, 0x0000EE, 0xCD00CD, 0x00CDCD, 0xE5E5E5, 0x7F7F7F, 0xFF0000, 0x00FF00, 0xFFFF00, 0x5C5CFF, 0xFF00FF, 0x00FFFF, 0xFFFFFF}
+	var rgb uint32
+	if color < 16 {
+		rgb = base[color]
+	} else if color < 232 {
+		n := color - 16
+		levels := [...]uint32{0, 95, 135, 175, 215, 255}
+		rgb = levels[n/36]<<16 | levels[(n/6)%6]<<8 | levels[n%6]
+	} else if color < 256 {
+		v := uint32(8 + (color-232)*10)
+		rgb = v<<16 | v<<8 | v
+	}
+	return (rgb&0xFF)<<16 | (rgb & 0xFF00) | (rgb>>16)&0xFF
 }
 
 func main() {
