@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -59,6 +60,7 @@ const (
 	idDisconnect = 1003
 	idStatus     = 1004
 	enChange     = 0x0300
+	gcsCompStr   = 0x0008
 
 	cellWidth     = 10
 	cellHeight    = 20
@@ -200,23 +202,10 @@ func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 	case wmCommand:
 		controlID := uint16(wParam)
 		notifyCode := uint16(wParam >> 16)
-		focus, _, _ := winapi.User32.NewProc("GetFocus").Call()
-		hostLength := uintptr(0)
-		if controlID == idHost && hostEdit != 0 {
-			hostLength, _, _ = winapi.User32.NewProc("GetWindowTextLengthW").Call(hostEdit)
-		}
-		telemetryf("wm_command_begin control_id=%d notify_code=%d child=%d focus=%d host_length=%d", controlID, notifyCode, lParam, focus, hostLength)
-		defer telemetryf("wm_command_end control_id=%d notify_code=%d", controlID, notifyCode)
-		if controlID == idHost && notifyCode == enChange {
-			telemetryf("host_edit_change length=%d", hostLength)
-			// The native EDIT control has already applied the change. Consume its
-			// notifications here instead of forwarding child-control WM_COMMAND
-			// messages to the parent window's default procedure.
-			return 0
-		}
 		if controlID == idHost {
-			// Focus/update notifications from the EDIT control need no parent
-			// default processing either.
+			if notifyCode == enChange {
+				telemetryf("host_edit_change")
+			}
 			return 0
 		}
 		switch controlID {
@@ -231,7 +220,6 @@ func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 				return 0
 			}
 		}
-		// Let Windows process notifications from the EDIT and other child controls.
 		r, _, _ := winapi.DefWindowProcW.Call(hwnd, uintptr(message), wParam, lParam)
 		return r
 	case wmChar:
@@ -370,7 +358,7 @@ func copySelection() {
 		kernel32.NewProc("GlobalFree").Call(h)
 		return
 	}
-	copy(unsafe.Slice((*uint16)(unsafe.Pointer(p)), len(text16)), text16)
+	kernel32.NewProc("RtlMoveMemory").Call(p, uintptr(unsafe.Pointer(&text16[0])), uintptr(len(text16)*2))
 	kernel32.NewProc("GlobalUnlock").Call(h)
 	opened, _, _ := winapi.User32.NewProc("OpenClipboard").Call(0)
 	if opened == 0 {
@@ -400,13 +388,13 @@ func pasteClipboard() {
 		winapi.User32.NewProc("CloseClipboard").Call()
 		return
 	}
-	size, _, _ := winapi.Kernel32.NewProc("GlobalSize").Call(h)
-	units := unsafe.Slice((*uint16)(unsafe.Pointer(p)), int(size/2))
-	n := 0
-	for n < len(units) && units[n] != 0 {
-		n++
+	n, _, _ := winapi.Kernel32.NewProc("lstrlenW").Call(p)
+	var value string
+	if n > 0 {
+		units := make([]uint16, n)
+		winapi.Kernel32.NewProc("RtlMoveMemory").Call(uintptr(unsafe.Pointer(&units[0])), p, n*2)
+		value = string(utf16.Decode(units))
 	}
-	value := string(utf16.Decode(units[:n]))
 	winapi.Kernel32.NewProc("GlobalUnlock").Call(h)
 	winapi.User32.NewProc("CloseClipboard").Call()
 	value = strings.ReplaceAll(strings.ReplaceAll(value, "\r\n", "\n"), "\n", "\r")
@@ -835,7 +823,25 @@ func colorRef(color uint32) uint32 {
 	return term.ColorRef(color)
 }
 
+// isIMEComposing returns true if an input method editor (IME) is actively composing text.
+func isIMEComposing(hwnd uintptr) bool {
+	hIMC, _, _ := winapi.ImmGetContext.Call(hwnd)
+	if hIMC == 0 {
+		return false
+	}
+	defer winapi.ImmReleaseContext.Call(hwnd, hIMC)
+	res, _, _ := winapi.ImmGetCompositionStringW.Call(hIMC, gcsCompStr, 0, 0)
+	return int32(res) > 0
+}
+
+func init() {
+	runtime.LockOSThread()
+}
+
 func main() {
+	runtime.LockOSThread()
+	winapi.OleInitialize.Call(0)
+	defer winapi.OleUninitialize.Call()
 	initTelemetry()
 	defer func() {
 		telemetryf("shutdown")
@@ -875,6 +881,11 @@ func main() {
 		if m.Message == wmKeyDown && m.WParam == 0x0D { // VK_RETURN
 			focus, _, _ := winapi.User32.NewProc("GetFocus").Call()
 			if focus == hostEdit {
+				if isIMEComposing(hostEdit) {
+					winapi.TranslateMessage.Call(uintptr(unsafe.Pointer(&m)))
+					winapi.DispatchMessageW.Call(uintptr(unsafe.Pointer(&m)))
+					continue
+				}
 				connectSSH(hwnd)
 				continue
 			}

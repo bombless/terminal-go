@@ -9,6 +9,8 @@ var (
 	User32           = syscall.NewLazyDLL("user32.dll")
 	Gdi32            = syscall.NewLazyDLL("gdi32.dll")
 	Kernel32         = syscall.NewLazyDLL("kernel32.dll")
+	Ole32            = syscall.NewLazyDLL("ole32.dll")
+	Imm32            = syscall.NewLazyDLL("imm32.dll")
 	RegisterClassExW = User32.NewProc("RegisterClassExW")
 	CreateWindowExW  = User32.NewProc("CreateWindowExW")
 	DefWindowProcW   = User32.NewProc("DefWindowProcW")
@@ -30,6 +32,12 @@ var (
 	SetBkColor       = Gdi32.NewProc("SetBkColor")
 	SetBkMode        = Gdi32.NewProc("SetBkMode")
 	FrameRect        = User32.NewProc("FrameRect")
+
+	OleInitialize            = Ole32.NewProc("OleInitialize")
+	OleUninitialize          = Ole32.NewProc("OleUninitialize")
+	ImmGetContext            = Imm32.NewProc("ImmGetContext")
+	ImmReleaseContext        = Imm32.NewProc("ImmReleaseContext")
+	ImmGetCompositionStringW = Imm32.NewProc("ImmGetCompositionStringW")
 
 	// ConPTY and process APIs are exported by Kernel32 on supported Windows versions.
 	CreatePseudoConsole               = Kernel32.NewProc("CreatePseudoConsole")
