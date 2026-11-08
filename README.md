@@ -1,42 +1,47 @@
 # terminal-go
 
-一个面向 Windows 的原生终端模拟器，目标是使用 **GCCGO** 编译，并通过 Windows API 实现窗口与控制台宿主。
+`terminal-go` is a native Windows SSH terminal frontend. Its only interactive child process is the Windows OpenSSH client (`ssh.exe`); it is not a local PowerShell, CMD, or general-purpose shell emulator.
 
-## 当前开发状态
+## Current status
 
-当前分支包含 Win32 GUI、终端屏幕缓冲区和基础 ANSI/VT 解析核心。解析器支持跨多次输入的 UTF-8 多字节字符与 CSI 序列，以及部分光标移动、擦除和基础 SGR 颜色控制。屏幕缓冲区有对应的回归测试。
+The Win32 GUI now has a host entry field, Connect/Disconnect controls, connection status, and a terminal drawing surface. Connect launches only `ssh.exe` inside ConPTY. A background reader feeds output chunks into the incremental VT parser; `WM_CHAR` and common navigation keys are forwarded to the ConPTY input pipe; `WM_SIZE` resizes both the screen grid and pseudoconsole. Screen updates and painting are synchronized, and the GUI build/test/vet checks pass on Windows amd64.
 
-ConPTY 会话、完整交互式 Shell、完整 VT 兼容性、Unicode 字形宽度与剪贴板尚未完成；不会将当前原型描述为完整终端。新增 Go 测试尚未在本次开发环境执行，GCCGO/Windows 构建也尚未验证。
+This is an early interactive slice, not yet a full terminal emulator. Current limitations include basic host-only connection arguments (no GUI controls yet for port, identity file, or arbitrary SSH options), a basic key map, no scrollback or clipboard, no full VT/alternate-screen/color rendering, and no end-to-end authentication/server test in this session. Unicode input is UTF-8 encoded, but rendering still does not correctly handle surrogate pairs, combining marks, or East Asian display width. Use the standard OpenSSH host-key and authentication prompts; host-key checking is not disabled.
 
-## 目标环境
+## Requirements
 
-- Windows 10 1809 或更新版本（ConPTY 集成后）
-- MinGW-w64 GCCGO，目标架构需与 Windows 一致
-- 不使用 CGO
+- Windows 10 version 1809 (build 17763) or later for ConPTY.
+- The official Go toolchain (`gc`), Windows amd64.
+- Windows OpenSSH Client, with `ssh.exe` available in `%WINDIR%\\System32\\OpenSSH` or on `PATH`.
 
-## 计划能力
+Install Go from <https://go.dev/dl/> and enable/install the Windows OpenSSH Client optional feature from Windows Settings if it is not already present.
 
-- Win32 原生窗口、绘制与消息循环
-- ConPTY + CreateProcessW 启动 PowerShell / CMD
-- ANSI/VT100/VT220 转义序列、颜色、光标与滚动
-- 键盘输入、Unicode、剪贴板和窗口尺寸同步
+## Build and test
 
-## 编译
+From the repository root in PowerShell:
 
-尚未确定并验证 GCCGO/MinGW-w64 工具链版本与 Windows 目标三元组。请先参考 `TODO.md` 的 P0 清单；在真实 Windows + GCCGO 环境验证前，不提供未经验证的构建命令。
-
-## 测试
-
-在兼容的 Go 开发环境中可运行：
-
-```sh
+```powershell
 go test ./...
+go vet ./...
+go build ./...
+go build -o .\\terminal.exe .\\cmd\\terminal
 ```
 
-这仅用于终端核心的常规 Go 测试，不代表 GCCGO Windows 目标构建或 Win32 GUI 已通过验证。
+Run `.\\terminal.exe`, enter `user@host` or `host`, and select **Connect**. OpenSSH handles authentication and host-key verification. Select **Disconnect** to close the current session. `terminal.exe` is a local build artifact and should not be committed.
 
-## 目录
+## Security and architecture
 
-- `cmd/terminal`：Windows GUI 入口
-- `internal/winapi`：Win32 API 封装
-- `internal/term`：屏幕缓冲区与 VT 解析器
+- Launch only `ssh.exe`, attached to a Windows ConPTY instance; never launch a local shell.
+- Delegate SSH protocol, authentication, host-key verification, and known-hosts handling to the installed OpenSSH client.
+- Preserve normal host-key and authentication prompts; never disable host-key checking or silently accept changed host keys.
+- Do not invoke a shell to construct process commands. Pass a properly quoted Windows command line directly to `CreateProcessW`.
+- Keep process output off the Win32 message loop and close native handles deterministically.
+
+## Project layout
+
+- `cmd/terminal`: Win32 GUI entry point and GUI/session integration
+- `internal/winapi`: dynamically loaded Win32 and ConPTY procedures
+- `internal/term`: terminal screen buffer and incremental VT parser
+- `internal/sshclient`: OpenSSH discovery, Windows argument quoting, and ConPTY process/session lifecycle
+
+See `TODO.md` for remaining implementation priorities and the manual Windows integration test checklist.

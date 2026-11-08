@@ -1,113 +1,106 @@
-# TODO — terminal-go Windows Terminal
+# TODO — terminal-go Windows SSH Terminal
 
-> 交接文档：供新的 ChatGPT 会话继续开发。当前工作分支为 `feature/windows-terminal`，基于 `main`。
-> 当前 PR：[#1 — feat: bootstrap native Windows terminal foundation](https://github.com/bombless/terminal-go/pull/1)
+> Handoff note for the next ChatGPT session. Work on branch `feature/windows-terminal` (PR #1).
+> The intended product is a native Windows terminal window whose only interactive backend is the local `ssh.exe` client.
 
-## 项目目标
+## Product goal
 
-实现一个 Windows 原生终端模拟器，使用 **GCCGO** 编译，通过 Windows API 实现窗口、伪终端与 Shell 进程管理。不使用 CGO。
+Build a lightweight native Windows GUI terminal that launches the Windows OpenSSH client (`ssh.exe`) and displays its interactive remote terminal session. Do **not** implement or launch a local PowerShell, CMD, or other local shell. The application is an SSH terminal frontend, not a general local shell emulator.
 
-目标 Shell：PowerShell、CMD（后续可扩展到其他控制台程序）。
+Use the **official Go toolchain (gc)**. GCCGO is no longer a project requirement. Do not spend time installing GCCGO or validating GCCGO ABI compatibility. Do not use CGO unless a concrete, documented requirement makes it unavoidable.
 
-## 当前仓库状态
+## Current repository and verified environment
 
-目前已经提交到 `feature/windows-terminal` 的文件：
+- Branch: `feature/windows-terminal`.
+- Module: `github.com/bombless/terminal-go`.
+- Existing PR: https://github.com/bombless/terminal-go/pull/1
+- `internal/term/screen.go`: fixed-size cell buffer and screen operations.
+- `internal/term/vt.go`: incremental ANSI/VT parser, UTF-8 decoding, CSI cursor operations, erase operations, and basic 16-color SGR.
+- `internal/term/screen_test.go`, `internal/term/vt_test.go`: screen and parser tests.
+- `internal/winapi/procs_windows.go`: dynamically loaded Win32 procedures.
+- `cmd/terminal/main.go`: Win32 host-entry/Connect/Disconnect toolbar, connection status, background ConPTY output reader feeding the VT parser, basic keyboard forwarding, synchronized paint, and screen/ConPTY resize. Live authentication against a remote SSH server has not yet been exercised.
+- Build environment used: Windows amd64, official `go1.27.0 windows/amd64`, `CGO_ENABLED=1`.
+- Verified successfully on `desktop-01`: `go test ./...`, `go vet ./...`, `go build ./...`, and `go build -o .\terminal.exe .\cmd\terminal`.
+- The generated `terminal.exe` is a local untracked build artifact; do not commit it.
+- `internal/sshclient/conpty_windows.go` now provides a Windows amd64 ConPTY process/session wrapper and a runtime smoke test using the installed `ssh.exe -V`; the GUI is not yet wired to this wrapper and still lacks interactive input/output integration.
 
-- `go.mod` — Go module：`github.com/bombless/terminal-go`
-- `README.md` — 项目方向、目录与当前状态说明
-- `internal/term/screen.go` — 固定尺寸终端单元格缓冲区、擦除行/屏幕操作
-- `internal/term/vt.go` — 可跨 Feed 保留状态的基础 ANSI/VT 解析器，含 UTF-8 解码、光标移动、擦除与基础 SGR
-- `internal/term/screen_test.go` — 屏幕换行滚动、擦除与光标边界测试
-- `internal/term/vt_test.go` — 分段 CSI、分段 UTF-8、擦除与 SGR 回归测试
-- `internal/winapi/procs_windows.go` — Win32 DLL / procedure 动态绑定
-- `cmd/terminal/main.go` — Win32 GUI 窗口、GDI 绘制与消息循环
+## Architecture and scope decisions
 
-### 当前实现边界
+1. The only child program to launch is `ssh.exe` (normally Windows OpenSSH at `%WINDIR%\System32\OpenSSH\ssh.exe`, but resolve it robustly and allow configuration/override).
+2. Do not launch `powershell.exe`, `pwsh.exe`, `cmd.exe`, WSL shells, or a local shell as a session backend.
+3. Use Windows ConPTY as the local pseudo-terminal between the GUI and `ssh.exe`. ConPTY is still required: interactive OpenSSH needs a terminal for input, terminal dimensions, and VT behavior. ConPTY hosts `ssh.exe` only; it is not being used to host a local shell.
+4. `ssh.exe` owns SSH protocol, authentication, host-key verification, remote PTY negotiation, and remote process/session behavior. Do not implement SSH protocol or authentication in Go.
+5. Launch `ssh.exe` with `CreateProcessW` and `STARTUPINFOEXW`, attaching the ConPTY through `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE`. Prefer argument-safe Windows command-line construction; never concatenate untrusted input into a shell command.
+6. Preserve normal OpenSSH behavior: host-key prompts, password/passphrase prompts, keyboard-interactive auth, key/agent use, known_hosts checks, and remote interactive TUI applications. Do not bypass host-key verification.
+7. Keep UI/message handling responsive. Process I/O must not block the Win32 message loop. Manage process, pseudoconsole, pipes, and worker goroutines/threads with deterministic shutdown and error handling.
 
-**这是一个初始脚手架，不是可用的交互式终端。**
+## TODO priorities
 
-- GUI 窗口与消息循环已搭建。
-- 屏幕缓冲区与基础 VT 指令解析已搭建；解析器可处理跨多次 Feed 的 UTF-8 字符和 CSI 序列。
-- VT 当前覆盖光标相对移动/定位、擦除行/屏和基础 16 色 SGR 的部分指令；尚不完整。
-- 尚未创建 ConPTY，也未启动 PowerShell/CMD。
-- 尚未实现键盘输入、Shell 输出管道、窗口 resize。
-- 尚未在 Windows 上用 GCCGO 实际编译或运行验证；本次改动也未执行 Go 测试。
+### P0 — official Go baseline and project cleanup
 
-## TODO 优先级
+- [x] Build and test with official Go on Windows amd64 (`go test ./...`, `go vet ./...`, `go build ./...`).
+- [x] Produce a Windows GUI executable with `go build -o .\terminal.exe .\cmd\terminal`.
+- [x] Remove stale GCCGO-only claims from README and GUI labels; remaining TODO mentions explicitly mark GCCGO out of scope.
+- [x] Document official Go installation/build/test commands and the Windows OpenSSH prerequisite in README.
+- [x] Add `internal/sshclient.ResolveExecutable` for explicit override, standard Windows OpenSSH path, and PATH lookup with actionable errors.
 
-### P0 — 先让工程能在目标工具链编译
+### P1 — launch ssh.exe in ConPTY
 
-- [ ] 确定目标 GCCGO 发行版、版本与目标三元组（例如 x86_64-w64-mingw32）。
-- [ ] 在真实 Windows + GCCGO 环境编译整个项目，记录完整命令和错误。
-- [ ] 验证 GCCGO 是否提供当前代码使用的 `syscall.NewLazyDLL`、`syscall.NewCallback`、`syscall.StringToUTF16Ptr` 等 API。
-- [ ] 如果 GCCGO 的 syscall 包不兼容，改为适合该工具链的纯 Go Win32 动态调用封装；不要引入 CGO。
-- [ ] 检查 Win32 结构体布局、字段对齐、指针宽度和调用约定，确保 32/64 位目标不会发生 ABI 错误。
-- [ ] 添加可重复的 Windows 构建脚本（PowerShell 或 Makefile），并在 README 中写清楚前置条件。
+- [x] Add the required Win32 declarations/procedure bindings for ConPTY and process creation: `CreatePseudoConsole`, `ResizePseudoConsole`, `ClosePseudoConsole`, `CreatePipe`, `InitializeProcThreadAttributeList`, `UpdateProcThreadAttribute`, `DeleteProcThreadAttributeList`, `CreateProcessW`, `GetExitCodeProcess`, `WaitForSingleObject`, and required handle-management APIs.
+- [x] Define and verify the Go layouts/constants for `COORD`, `STARTUPINFOEXW`, `PROCESS_INFORMATION`, `SECURITY_ATTRIBUTES`, and `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` on Windows amd64. Keep pointer sizes/alignment correct.
+- [x] Create ConPTY input/output pipes and a pseudoconsole with the initial requested dimensions.
+- [x] Resolve `ssh.exe` without invoking a shell. Support the standard Windows OpenSSH location and PATH lookup; allow an explicit executable override.
+- [ ] Add a higher-level argument builder for common usage (`user@host`, `-p`, `-i`, and additional SSH options); the current `Start` accepts an argument slice and quotes it safely for `CreateProcessW`. Do not log secrets or expose private-key contents.
+- [x] Launch only `ssh.exe` attached to the pseudoconsole via an extended startup attribute list; reject any other executable basename.
+- [x] Implement asynchronous output reading from the ConPTY pipe and feed byte chunks into the existing incremental VT parser.
+- [x] Implement UTF-8/control-key input forwarding through a dedicated FIFO writer goroutine; handle partial writes, errors, and broken pipes without blocking the Win32 message loop.
+- [ ] Preserve interactive SSH prompts and remote TUI behavior; ensure the application does not swallow or reinterpret SSH authentication/host-key prompts.
+- [x] Handle child exit, startup failure, pipe closure, and cleanup on the implemented process/session wrapper paths. Close process/thread handles, pipes, attribute lists, and pseudoconsole exactly once.
+- [x] Add an explicit Connect/Disconnect lifecycle and useful connection error/status display in the GUI.
 
-> 阻塞说明：当前会话没有可执行的 Windows + GCCGO runner，也无法从 GitHub 连接器执行仓库构建。P0 仍未验证，不应仅凭源码推断 syscall API 或 Win32 ABI 正确。
+### P2 — terminal interaction and resizing
 
-### P1 — 完成最小可交互终端（ConPTY）
+- [ ] Handle `WM_SIZE`, calculate terminal rows/columns from client size and cell metrics, and call `ResizePseudoConsole`.
+- [x] Resize the screen buffer consistently with ConPTY; screen resize, parser updates, and painting share a mutex.
+- [ ] Implement keyboard input mapping for printable text, Enter, Backspace, Tab, Escape, arrows, Home/End, Insert/Delete, PageUp/PageDown, and Ctrl combinations commonly used by remote shells/TUIs.
+- [ ] Ensure key events and text input handle Unicode correctly; document any Windows input limitations.
+- [ ] Improve rendering: font selection, cell metrics, foreground/background colors, cursor visibility/position, scrolling, and invalidation.
+- [ ] Correctly handle UTF-8 split across reads, non-BMP characters, combining marks, and East Asian wide-character cell width.
+- [ ] Implement scrollback and selection/copy/paste if required for a usable SSH terminal.
+- [ ] Handle DPI changes and minimum window size.
 
-- [ ] 为 `internal/winapi` 补齐必要的 Win32 类型、常量和 API。
-- [ ] 动态加载 `CreatePseudoConsole`、`ResizePseudoConsole`、`ClosePseudoConsole`（Kernel32）。
-- [ ] 使用 `CreatePipe` 创建 ConPTY 输入/输出管道。
-- [ ] 使用 `STARTUPINFOEXW`、属性列表与 `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` 将伪控制台关联到子进程。
-- [ ] 使用 `CreateProcessW` 启动 PowerShell；提供 CMD 作为可配置 Shell。
-- [ ] 正确处理句柄继承、关闭顺序、错误码与资源释放。
-- [ ] 建立独立输出读取循环，将 Shell 输出送入终端解析器。
-- [ ] 建立键盘输入路径，将字符和控制键编码后写入 ConPTY 输入管道。
-- [ ] 处理窗口关闭、子进程退出、管道断开和异常退出。
-- [ ] 明确最低系统版本：ConPTY 从 Windows 10 version 1809 / build 17763 开始提供。
+### P3 — robustness and usability
 
-### P2 — 终端渲染和输入
+- [x] Add tests for SSH argument quoting and executable discovery.
+- [ ] Add tests for process lifecycle state, input mapping, and parser integration.
+- [ ] Add a manual Windows test checklist covering password auth, key auth, host-key first-use/change prompts, keyboard-interactive auth, disconnects, network loss, resize, and remote TUI programs (for example `vim`, `top`, and `htop` where installed remotely).
+- [ ] Verify remote UTF-8 and color behavior against common SSH servers.
+- [ ] Add configurable default font, font size, colors, initial window size, and SSH executable path.
+- [ ] Add structured diagnostic logging that avoids credentials and sensitive command-line material.
+- [ ] Add Windows CI using the official Go toolchain.
+- [ ] Update README with setup, build, connection examples, supported behavior, and known limitations.
 
-- [ ] 处理 WM_SIZE，根据客户区大小计算列数/行数。
-- [ ] 根据新尺寸调用 `ResizePseudoConsole`，并调整屏幕缓冲区。
-- [ ] 改进 GDI 绘制：字体、行高、列宽、背景色、前景色、光标。
-- [ ] 实现颜色 SGR（基础 16 色、256 色，后续可选真彩色）。
-- [ ] 实现光标移动、定位、保存/恢复、清屏、擦除行/屏、滚屏。
-- [ ] 实现常用控制键：Enter、Backspace、Tab、方向键、Home/End、Delete、Ctrl+C 等。
-- [ ] 正确处理 UTF-8 解码和 UTF-16 输入；支持非 BMP 字符。
-- [ ] 处理组合字符和 East Asian Width（全角字符占两列）。
-- [ ] 增加剪贴板复制/粘贴。
-- [ ] 处理 DPI 缩放和字体尺寸变化。
+## Important implementation constraints
 
-### P3 — 稳定性、兼容性与体验
+- Official Go compiler only; GCCGO compatibility is explicitly out of scope.
+- No local PowerShell/CMD/local shell integration. `ssh.exe` is the only session child process.
+- No CGO by default. Prefer Win32 syscall/dynamic procedure bindings already used by the repository.
+- ConPTY is the local terminal transport for `ssh.exe`, not a local shell host.
+- Do not implement SSH protocol, cryptography, host-key storage, or authentication in Go; delegate these to the installed OpenSSH client.
+- Never disable host-key checking or silently accept changed host keys.
+- Keep the Win32 UI thread responsive; perform blocking process I/O away from the message loop.
+- Ensure deterministic cleanup of all native handles and synchronization between I/O, parser, screen, resize, and paint paths.
+- Test on the actual Windows target. A successful cross-platform compile is not a substitute for Windows runtime validation.
 
-- [x] 为 VT 解析器添加单元测试，覆盖跨多次 Feed 的分段转义序列。
-- [x] 添加屏幕缓冲区滚动、边界、擦除和光标测试。
-- [ ] 测试 PowerShell、CMD、常见 TUI 程序（例如编辑器、Git 交互命令）。
-- [ ] 处理窗口最小化、恢复、resize、快速输出和退出竞态。
-- [ ] 避免 UI 线程被管道读写阻塞。
-- [ ] 增加可配置字体、字号、配色和初始 Shell。
-- [ ] 增加日志和可诊断错误信息。
-- [ ] 添加 Windows CI（若可获得 GCCGO runner/toolchain）。
-- [ ] 更新 README：安装、构建、运行、限制和已测试环境。
+## Suggested next steps
 
-## 技术约束与实现建议
+1. Wire `internal/sshclient.Session` into the Win32 GUI with an explicit Connect/Disconnect lifecycle and visible connection status.
+2. Drain `Session.Output` on a dedicated goroutine, feed byte chunks into the incremental VT parser under screen synchronization, and invalidate the window without blocking the message loop.
+3. Add a dedicated input writer and map `WM_CHAR`/`WM_KEYDOWN` to UTF-8 and terminal control sequences; preserve Unicode and SSH authentication prompts.
+4. Handle `WM_SIZE`, resize both the screen grid and ConPTY, and synchronize resize, parser, and paint operations.
+5. Add tests for argument construction, process lifecycle, input mapping, and parser integration; then manually verify password/key auth, host-key prompts, network loss, resize, and remote TUI programs.
+6. Keep `terminal.exe` untracked, run `CGO_ENABLED=0 go test ./...`, `go vet ./...`, and `go build ./...`, and continue focused work on PR #1.
 
-1. **GCCGO 是硬约束。** 不要默认标准 Go 的 Windows API 封装在 GCCGO 中都可用。每个关键 syscall/API 都要用指定 GCCGO 工具链实测。
-2. **不使用 CGO。** Windows API 通过纯 Go syscall/动态过程调用接入。
-3. **ConPTY 是 Shell 集成方案。** 不要只用 `cmd.exe` 标准输入输出重定向冒充完整终端；交互式 TUI 需要伪控制台语义。
-4. **窗口消息与 I/O 分离。** Win32 UI 消息循环不能被 Shell 输出读取或管道写入阻塞。
-5. **资源生命周期明确。** 句柄、伪控制台、进程、线程、管道与属性列表都要在成功/失败路径释放。
-6. **先做可验证的垂直切片。** 优先达成“启动窗口 → ConPTY → 启动 PowerShell → 能输入命令并看到输出 → resize → 正常退出”，再扩展完整 VT 特性。
-7. **不要声称已通过编译或运行测试，除非确实在目标 Windows/GCCGO 环境执行过。**
+## Current PR
 
-## 本次会话进展
-
-- 改进 VT 解析器：UTF-8 多字节字符可跨 Feed 解码；CSI 状态可跨 Feed 保留；补充光标相对移动、定位、擦除行/屏和更多基础 SGR。
-- 补充屏幕缓冲区擦除操作。
-- 新增 VT 与屏幕缓冲区回归测试。
-- 未执行 `go test`、Windows 构建或 GUI 运行；请在可用工具链上验证后再推进 P0。
-
-## 建议下一会话的第一步
-
-1. 先读取仓库 `README.md`、`go.mod`、本文件和现有源文件，确认分支仍是 `feature/windows-terminal`。
-2. 优先取得可复现的 MinGW-w64 GCCGO 工具链和 Windows runner，解决 P0 并运行新增测试。
-3. 检查当前 Win32 结构体与回调签名；修复 ABI/编译问题后再开始 ConPTY。
-4. 每完成一个可独立验证的阶段，提交小而清晰的 commit，并更新本文件的勾选状态。
-
-## 当前 PR
-
-继续在 PR #1 上迭代，不要另起一条无关分支，除非维护者明确要求。
+Continue work on PR #1 unless there is a clear reason to split the work. Keep commits focused and update this TODO as each verified item is completed.
