@@ -4,9 +4,14 @@ package main
 
 import (
 	"fmt"
+	"log"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
+	"time"
+	"unicode/utf16"
 	"unicode/utf8"
 	"unsafe"
 
@@ -33,7 +38,16 @@ const (
 	wmChar             = 0x0102
 	wmKeyDown          = 0x0100
 	wmCommand          = 0x0111
+	wmTimer            = 0x0113
 	wmPaint            = 0x000F
+	wmMouseMove        = 0x0200
+	wmLButtonDown      = 0x0201
+	wmLButtonUp        = 0x0202
+	wmRButtonUp        = 0x0205
+	mkLButton          = 0x0001
+	vkControl          = 0x11
+	cfUnicodeText      = 13
+	globalMoveable     = 0x0002
 	colorWindow        = 5
 	swShow             = 5
 
@@ -41,6 +55,7 @@ const (
 	idConnect    = 1002
 	idDisconnect = 1003
 	idStatus     = 1004
+	enChange     = 0x0300
 
 	cellWidth     = 10
 	cellHeight    = 20
@@ -77,6 +92,12 @@ type pendingInput struct {
 	data    []byte
 }
 
+type textSelection struct {
+	start, end int
+	active     bool
+	dragging   bool
+}
+
 var (
 	className                                              = syscall.StringToUTF16Ptr("TerminalGoWindow")
 	windowTitle                                            = syscall.StringToUTF16Ptr("terminal-go - SSH Terminal")
@@ -88,28 +109,115 @@ var (
 	inputWriteMu                                           sync.Mutex
 	session                                                *sshclient.Session
 	inputQueue                                             = make(chan pendingInput, 256)
+	selection                                              textSelection
+	telemetry                                              *log.Logger
+	telemetryFile                                          *os.File
+	paintFrames                                            uint64
+	lastSlowPaint                                          time.Time
+	lastHeartbeat                                          time.Time
 )
+
+func initTelemetry() {
+	dir, err := os.UserConfigDir()
+	if err == nil {
+		dir = filepath.Join(dir, "terminal-go")
+		err = os.MkdirAll(dir, 0700)
+	}
+	if err != nil {
+		dir = os.TempDir()
+	}
+	path := filepath.Join(dir, "telemetry.log")
+	f, openErr := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if openErr != nil {
+		return
+	}
+	telemetryFile = f
+	telemetry = log.New(f, "", log.LstdFlags|log.Lmicroseconds)
+	telemetry.Printf("telemetry_file=%s", path)
+	telemetry.Printf("startup version=dev screen=%dx%d; terminal contents, clipboard text, and host names are not logged", screen.Width, screen.Height)
+}
+
+func telemetryf(format string, args ...any) {
+	if telemetry != nil {
+		telemetry.Printf(format, args...)
+	}
+}
 
 func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 	switch message {
 	case wmCreate:
+		telemetryf("window_message wm_create_begin")
 		createToolbar(hwnd)
+		winapi.User32.NewProc("SetTimer").Call(hwnd, 1, 1000, 0)
+		lastHeartbeat = time.Now()
+		telemetryf("window_message wm_create_end host=%d connect=%d disconnect=%d status=%d", hostEdit, connectButton, disconnectButton, statusLabel)
 		return 0
 	case wmSize:
+		telemetryf("window_message wm_size_begin width=%d height=%d", uint16(lParam), uint16(lParam>>16))
 		layoutToolbar(hwnd, int32(uint16(lParam)), int32(uint16(lParam>>16)))
 		resizeTerminal(hwnd)
+		telemetryf("window_message wm_size_end")
 		return 0
-	case wmCommand:
-		switch uint16(wParam) {
-		case idConnect:
-			connectSSH(hwnd)
-		case idDisconnect:
-			disconnectSSH("Disconnected")
+	case wmLButtonDown:
+		x, y := mouseCell(lParam)
+		selection = textSelection{start: y*screen.Width + x, end: y*screen.Width + x, active: true, dragging: true}
+		winapi.User32.NewProc("SetCapture").Call(hwnd)
+		winapi.User32.NewProc("InvalidateRect").Call(hwnd, 0, 0)
+		return 0
+	case wmMouseMove:
+		if selection.dragging && wParam&mkLButton != 0 {
+			x, y := mouseCell(lParam)
+			selection.end = y*screen.Width + x
+			winapi.User32.NewProc("InvalidateRect").Call(hwnd, 0, 0)
 		}
 		return 0
+	case wmRButtonUp:
+		showClipboardMenu(hwnd, lParam)
+		return 0
+	case wmLButtonUp:
+		if selection.dragging {
+			x, y := mouseCell(lParam)
+			selection.end = y*screen.Width + x
+			selection.dragging = false
+			winapi.User32.NewProc("ReleaseCapture").Call()
+			winapi.User32.NewProc("InvalidateRect").Call(hwnd, 0, 0)
+		}
+		return 0
+	case wmCommand:
+		controlID := uint16(wParam)
+		notifyCode := uint16(wParam >> 16)
+		focus, _, _ := winapi.User32.NewProc("GetFocus").Call()
+		hostLength := uintptr(0)
+		if controlID == idHost && hostEdit != 0 {
+			hostLength, _, _ = winapi.User32.NewProc("GetWindowTextLengthW").Call(hostEdit)
+		}
+		telemetryf("wm_command_begin control_id=%d notify_code=%d child=%d focus=%d host_length=%d", controlID, notifyCode, lParam, focus, hostLength)
+		defer telemetryf("wm_command_end control_id=%d notify_code=%d", controlID, notifyCode)
+		if controlID == idHost && notifyCode == enChange {
+			telemetryf("host_edit_change length=%d", hostLength)
+		}
+		switch controlID {
+		case idConnect:
+			if notifyCode == 0 { // BN_CLICKED
+				connectSSH(hwnd)
+				return 0
+			}
+		case idDisconnect:
+			if notifyCode == 0 { // BN_CLICKED
+				disconnectSSH("Disconnected")
+				return 0
+			}
+		}
+		// Let Windows process notifications from the EDIT and other child controls.
+		r, _, _ := winapi.DefWindowProcW.Call(hwnd, uintptr(message), wParam, lParam)
+		return r
 	case wmChar:
-		if wParam == 3 { // Ctrl+C is sent to the remote terminal, not handled locally.
-			writeInput([]byte{3})
+		if wParam == 3 {
+			if selection.active && selection.start != selection.end {
+				copySelection()
+			} else {
+				writeInput([]byte{3}) // Preserve remote Ctrl+C when no text is selected.
+			}
 		} else if r := rune(wParam); r >= 0x20 || r == '\r' || r == '\n' || r == '\t' || r == 0x08 || r == 0x1b {
 			buf := make([]byte, utf8.RuneLen(r))
 			if r == '\r' || r == '\n' {
@@ -127,12 +235,36 @@ func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 		}
 		return 0
 	case wmKeyDown:
+		if keyDown(vkControl) {
+			switch wParam {
+			case 'C':
+				if selection.active && selection.start != selection.end {
+					copySelection()
+					return 0
+				}
+			case 'V':
+				pasteClipboard()
+				return 0
+			case 'A':
+				selectAll(hwnd)
+				return 0
+			}
+		}
 		if seq := keySequence(wParam); len(seq) != 0 {
 			writeInput(seq)
 			return 0
 		}
 	case wmPaint:
+		telemetryf("window_message wm_paint_begin")
 		paint(hwnd)
+		telemetryf("window_message wm_paint_end")
+		return 0
+	case wmTimer:
+		if time.Since(lastHeartbeat) >= 5*time.Second {
+			hostLength, _, _ := winapi.User32.NewProc("GetWindowTextLengthW").Call(hostEdit)
+			telemetryf("ui_heartbeat message_loop_alive host_length=%d input_queue=%d", hostLength, len(inputQueue))
+			lastHeartbeat = time.Now()
+		}
 		return 0
 	case wmDestroy:
 		disconnectSSH("Window closed")
@@ -141,6 +273,154 @@ func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 	}
 	r, _, _ := winapi.DefWindowProcW.Call(hwnd, uintptr(message), wParam, lParam)
 	return r
+}
+
+func keyDown(key int) bool {
+	r, _, _ := winapi.User32.NewProc("GetKeyState").Call(uintptr(key))
+	return uint16(r)&0x8000 != 0
+}
+
+func selectAll(hwnd uintptr) {
+	screenMu.Lock()
+	selection = textSelection{start: 0, end: screen.Width*screen.Height - 1, active: true}
+	screenMu.Unlock()
+	winapi.User32.NewProc("InvalidateRect").Call(hwnd, 0, 0)
+}
+
+func selectedText() string {
+	screenMu.Lock()
+	defer screenMu.Unlock()
+	if !selection.active || selection.start == selection.end {
+		return ""
+	}
+	first, last := selection.start, selection.end
+	if first > last {
+		first, last = last, first
+	}
+	var out strings.Builder
+	for pos := first; pos <= last; pos++ {
+		x, y := pos%screen.Width, pos/screen.Width
+		if y >= screen.Height {
+			break
+		}
+		r := screen.Cells[y][x].Rune
+		if r == 0 {
+			r = ' '
+		}
+		out.WriteRune(r)
+		if x == screen.Width-1 && pos < last {
+			out.WriteByte('\n')
+		}
+	}
+	return strings.TrimRight(out.String(), " \n")
+}
+
+func copySelection() {
+	value := selectedText()
+	if value == "" {
+		return
+	}
+	text16, err := syscall.UTF16FromString(value)
+	if err != nil {
+		return
+	}
+	kernel32 := winapi.Kernel32
+	h, _, _ := kernel32.NewProc("GlobalAlloc").Call(globalMoveable, uintptr(len(text16)*2))
+	if h == 0 {
+		return
+	}
+	p, _, _ := kernel32.NewProc("GlobalLock").Call(h)
+	if p == 0 {
+		kernel32.NewProc("GlobalFree").Call(h)
+		return
+	}
+	copy(unsafe.Slice((*uint16)(unsafe.Pointer(p)), len(text16)), text16)
+	kernel32.NewProc("GlobalUnlock").Call(h)
+	opened, _, _ := winapi.User32.NewProc("OpenClipboard").Call(0)
+	if opened == 0 {
+		kernel32.NewProc("GlobalFree").Call(h)
+		return
+	}
+	winapi.User32.NewProc("EmptyClipboard").Call()
+	result, _, _ := winapi.User32.NewProc("SetClipboardData").Call(cfUnicodeText, h)
+	winapi.User32.NewProc("CloseClipboard").Call()
+	if result == 0 {
+		kernel32.NewProc("GlobalFree").Call(h)
+	}
+}
+
+func pasteClipboard() {
+	opened, _, _ := winapi.User32.NewProc("OpenClipboard").Call(0)
+	if opened == 0 {
+		return
+	}
+	h, _, _ := winapi.User32.NewProc("GetClipboardData").Call(cfUnicodeText)
+	if h == 0 {
+		winapi.User32.NewProc("CloseClipboard").Call()
+		return
+	}
+	p, _, _ := winapi.Kernel32.NewProc("GlobalLock").Call(h)
+	if p == 0 {
+		winapi.User32.NewProc("CloseClipboard").Call()
+		return
+	}
+	size, _, _ := winapi.Kernel32.NewProc("GlobalSize").Call(h)
+	units := unsafe.Slice((*uint16)(unsafe.Pointer(p)), int(size/2))
+	n := 0
+	for n < len(units) && units[n] != 0 {
+		n++
+	}
+	value := string(utf16.Decode(units[:n]))
+	winapi.Kernel32.NewProc("GlobalUnlock").Call(h)
+	winapi.User32.NewProc("CloseClipboard").Call()
+	value = strings.ReplaceAll(strings.ReplaceAll(value, "\r\n", "\n"), "\n", "\r")
+	if value != "" {
+		writeInput([]byte(value))
+	}
+}
+
+func showClipboardMenu(hwnd, lParam uintptr) {
+	menu, _, _ := winapi.User32.NewProc("CreatePopupMenu").Call()
+	if menu == 0 {
+		return
+	}
+	defer winapi.User32.NewProc("DestroyMenu").Call(menu)
+	appendItem := winapi.User32.NewProc("AppendMenuW")
+	copyText, pasteText, allText := syscall.StringToUTF16Ptr("Copy\tCtrl+C"), syscall.StringToUTF16Ptr("Paste\tCtrl+V"), syscall.StringToUTF16Ptr("Select all\tCtrl+A")
+	appendItem.Call(menu, 0, 1, uintptr(unsafe.Pointer(copyText)))
+	appendItem.Call(menu, 0, 2, uintptr(unsafe.Pointer(pasteText)))
+	appendItem.Call(menu, 0, 3, uintptr(unsafe.Pointer(allText)))
+	pt := point{X: int32(int16(uint16(lParam))), Y: int32(int16(uint16(lParam >> 16)))}
+	winapi.User32.NewProc("ClientToScreen").Call(hwnd, uintptr(unsafe.Pointer(&pt)))
+	cmd, _, _ := winapi.User32.NewProc("TrackPopupMenu").Call(menu, 0x0100, uintptr(pt.X), uintptr(pt.Y), 0, hwnd, 0)
+	switch cmd {
+	case 1:
+		copySelection()
+	case 2:
+		pasteClipboard()
+	case 3:
+		selectAll(hwnd)
+	}
+}
+
+func mouseCell(lParam uintptr) (int, int) {
+	x := int(int16(uint16(lParam)))
+	y := int(int16(uint16(lParam >> 16)))
+	x = (x - 12) / cellWidth
+	y = (y - toolbarHeight - 6) / cellHeight
+	if x < 0 {
+		x = 0
+	}
+	if y < 0 {
+		y = 0
+	}
+	if x >= screen.Width {
+		x = screen.Width - 1
+	}
+	if y >= screen.Height {
+		y = screen.Height - 1
+	}
+	return x, y
 }
 
 func createToolbar(hwnd uintptr) {
@@ -185,6 +465,8 @@ func setStatus(value string) {
 }
 
 func connectSSH(hwnd uintptr) {
+	connectStarted := time.Now()
+	telemetryf("connect_start")
 	sessionMu.Lock()
 	if session != nil {
 		sessionMu.Unlock()
@@ -201,12 +483,17 @@ func connectSSH(hwnd uintptr) {
 		return
 	}
 	setStatus("Starting SSH...")
+	resolveStarted := time.Now()
 	executable, err := sshclient.ResolveExecutable("")
+	telemetryf("ssh_resolve duration=%s err=%v", time.Since(resolveStarted), err)
 	if err != nil {
+		telemetryf("connect_failed stage=resolve total=%s", time.Since(connectStarted))
 		setStatus("SSH unavailable: " + err.Error())
 		return
 	}
+	spawnStarted := time.Now()
 	s, err := sshclient.Start(executable, []string{host}, screen.Width, screen.Height)
+	telemetryf("ssh_spawn duration=%s err=%v total=%s", time.Since(spawnStarted), err, time.Since(connectStarted))
 	if err != nil {
 		setStatus("Connect failed: " + err.Error())
 		return
@@ -226,15 +513,33 @@ func connectSSH(hwnd uintptr) {
 
 func readSessionOutput(s *sshclient.Session, hwnd uintptr) {
 	buf := make([]byte, 8192)
+	windowStart := time.Now()
+	var windowBytes, windowChunks int64
+	var parseTotal, parseMax time.Duration
 	for {
 		n, err := s.Output.Read(buf)
 		if n > 0 {
+			parseStart := time.Now()
 			screenMu.Lock()
 			parser.Feed(buf[:n])
 			screenMu.Unlock()
+			parseElapsed := time.Since(parseStart)
+			windowBytes += int64(n)
+			windowChunks++
+			parseTotal += parseElapsed
+			if parseElapsed > parseMax {
+				parseMax = parseElapsed
+			}
 			winapi.User32.NewProc("InvalidateRect").Call(hwnd, 0, 0)
+			if time.Since(windowStart) >= 5*time.Second {
+				telemetryf("output bytes=%d chunks=%d parse_total=%s parse_max=%s input_queue=%d", windowBytes, windowChunks, parseTotal, parseMax, len(inputQueue))
+				windowStart = time.Now()
+				windowBytes, windowChunks = 0, 0
+				parseTotal, parseMax = 0, 0
+			}
 		}
 		if err != nil {
+			telemetryf("output_reader_end err=%v pending_bytes=%d pending_chunks=%d", err, windowBytes, windowChunks)
 			break
 		}
 	}
@@ -252,8 +557,10 @@ func readSessionOutput(s *sshclient.Session, hwnd uintptr) {
 	_ = s.Close()
 	inputWriteMu.Unlock()
 	if waitErr != nil {
+		telemetryf("ssh_exit wait_error=%v", waitErr)
 		setStatus("SSH ended: " + waitErr.Error())
 	} else {
+		telemetryf("ssh_exit code=%d", code)
 		setStatus(fmt.Sprintf("SSH exited (%d)", code))
 	}
 }
@@ -269,6 +576,7 @@ func writeInput(data []byte) {
 	select {
 	case inputQueue <- item:
 	default:
+		telemetryf("input_queue_full queued=%d capacity=%d dropped_bytes=%d", len(inputQueue), cap(inputQueue), len(data))
 		setStatus("SSH input queue full")
 	}
 }
@@ -276,7 +584,9 @@ func writeInput(data []byte) {
 // inputWriter serializes pipe writes away from the Win32 message loop.
 func inputWriter() {
 	for item := range inputQueue {
+		itemStarted := time.Now()
 		inputWriteMu.Lock()
+		lockWait := time.Since(itemStarted)
 		sessionMu.Lock()
 		if session != item.session || item.session.Input == nil {
 			sessionMu.Unlock()
@@ -286,6 +596,8 @@ func inputWriter() {
 		input := item.session.Input
 		sessionMu.Unlock()
 		data := item.data
+		writeStarted := time.Now()
+		originalBytes := len(data)
 		for len(data) > 0 {
 			n, err := input.Write(data)
 			if err != nil {
@@ -297,6 +609,10 @@ func inputWriter() {
 				break
 			}
 			data = data[n:]
+		}
+		writeElapsed := time.Since(writeStarted)
+		if lockWait > 20*time.Millisecond || writeElapsed > 100*time.Millisecond {
+			telemetryf("input_write bytes=%d lock_wait=%s write_time=%s queue_remaining=%d", originalBytes, lockWait, writeElapsed, len(inputQueue))
 		}
 		inputWriteMu.Unlock()
 	}
@@ -368,6 +684,8 @@ func resizeTerminal(hwnd uintptr) {
 }
 
 func paint(hwnd uintptr) {
+	paintStarted := time.Now()
+	var runs, cells int
 	var ps paintStruct
 	hdc, _, _ := winapi.BeginPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
 	var rc rect
@@ -380,8 +698,19 @@ func paint(hwnd uintptr) {
 	for y := 0; y < screen.Height; y++ {
 		for x := 0; x < screen.Width; {
 			cell := screen.Cells[y][x]
+			selected := selection.active && isSelected(y*screen.Width+x)
+			if selected {
+				cell.BG, cell.FG = 0x00A56E2B, 0x00FFFFFF
+			}
 			end := x + 1
-			for end < screen.Width && screen.Cells[y][end].FG == cell.FG && screen.Cells[y][end].BG == cell.BG {
+			for end < screen.Width {
+				next := screen.Cells[y][end]
+				if selection.active && isSelected(y*screen.Width+end) {
+					next.BG, next.FG = 0x00A56E2B, 0x00FFFFFF
+				}
+				if next.FG != cell.FG || next.BG != cell.BG {
+					break
+				}
 				end++
 			}
 			left := int32(12 + x*cellWidth)
@@ -390,6 +719,8 @@ func paint(hwnd uintptr) {
 			cellBrush, _, _ := winapi.CreateSolidBrush.Call(uintptr(colorRef(cell.BG)))
 			winapi.FillRect.Call(hdc, uintptr(unsafe.Pointer(&background)), cellBrush)
 			winapi.DeleteObject.Call(cellBrush)
+			runs++
+			cells += end - x
 			line := make([]uint16, end-x)
 			for i := x; i < end; i++ {
 				r := screen.Cells[y][i].Rune
@@ -408,6 +739,22 @@ func paint(hwnd uintptr) {
 	}
 	screenMu.Unlock()
 	winapi.EndPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
+	elapsed := time.Since(paintStarted)
+	paintFrames++
+	if elapsed >= 50*time.Millisecond && time.Since(lastSlowPaint) >= time.Second {
+		telemetryf("paint_slow duration=%s cells=%d text_runs=%d frame=%d", elapsed, cells, runs, paintFrames)
+		lastSlowPaint = time.Now()
+	} else if paintFrames%100 == 0 {
+		telemetryf("paint_sample duration=%s cells=%d text_runs=%d frame=%d", elapsed, cells, runs, paintFrames)
+	}
+}
+
+func isSelected(position int) bool {
+	first, last := selection.start, selection.end
+	if first > last {
+		first, last = last, first
+	}
+	return position >= first && position <= last
 }
 
 // colorRef converts an ANSI palette index or tagged 24-bit RGB value to GDI COLORREF.
@@ -432,18 +779,36 @@ func colorRef(color uint32) uint32 {
 }
 
 func main() {
+	initTelemetry()
+	defer func() {
+		telemetryf("shutdown")
+		if telemetryFile != nil {
+			_ = telemetryFile.Close()
+		}
+	}()
+	telemetryf("main input_writer_start")
 	go inputWriter()
+	telemetryf("main before_get_module_handle")
 	instance, _, _ := winapi.Kernel32.NewProc("GetModuleHandleW").Call(0)
+	telemetryf("main after_get_module_handle instance=%d", instance)
 	wc := wndClassEx{Size: uint32(unsafe.Sizeof(wndClassEx{})), Style: csHRedraw | csVRedraw, WndProc: syscall.NewCallback(windowProc), Instance: instance, Background: colorWindow, ClassName: className}
+	telemetryf("main before_register_class")
 	if r, _, e := winapi.RegisterClassExW.Call(uintptr(unsafe.Pointer(&wc))); r == 0 {
+		telemetryf("main register_class_failed err=%v", e)
 		panic(e)
 	}
+	telemetryf("main after_register_class")
+	telemetryf("main before_create_window")
 	hwnd, _, e := winapi.CreateWindowExW.Call(0, uintptr(unsafe.Pointer(className)), uintptr(unsafe.Pointer(windowTitle)), wsOverlappedWindow|wsVisible, 100, 100, 1100, 720, 0, 0, instance, 0)
 	if hwnd == 0 {
+		telemetryf("main create_window_failed err=%v", e)
 		panic(e)
 	}
+	telemetryf("main after_create_window hwnd=%d", hwnd)
 	winapi.User32.NewProc("ShowWindow").Call(hwnd, swShow)
+	telemetryf("main after_show_window")
 	winapi.User32.NewProc("UpdateWindow").Call(hwnd)
+	telemetryf("main after_update_window")
 	var m msg
 	for {
 		r, _, _ := winapi.GetMessageW.Call(uintptr(unsafe.Pointer(&m)), 0, 0, 0)
