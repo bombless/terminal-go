@@ -11,6 +11,7 @@ var (
 	Kernel32               = syscall.NewLazyDLL("kernel32.dll")
 	Ole32                  = syscall.NewLazyDLL("ole32.dll")
 	Imm32                  = syscall.NewLazyDLL("imm32.dll")
+	Dwmapi                 = syscall.NewLazyDLL("dwmapi.dll")
 	RegisterClassExW       = User32.NewProc("RegisterClassExW")
 	CreateWindowExW        = User32.NewProc("CreateWindowExW")
 	DefWindowProcW         = User32.NewProc("DefWindowProcW")
@@ -38,12 +39,18 @@ var (
 	DeleteDC               = Gdi32.NewProc("DeleteDC")
 	IntersectClipRect      = Gdi32.NewProc("IntersectClipRect")
 	SelectClipRgn          = Gdi32.NewProc("SelectClipRgn")
+	CreatePen              = Gdi32.NewProc("CreatePen")
+	RoundRect              = Gdi32.NewProc("RoundRect")
+	Ellipse                = Gdi32.NewProc("Ellipse")
+	GetStockObject         = Gdi32.NewProc("GetStockObject")
+	DrawTextW              = User32.NewProc("DrawTextW")
 
 	OleInitialize            = Ole32.NewProc("OleInitialize")
 	OleUninitialize          = Ole32.NewProc("OleUninitialize")
 	ImmGetContext            = Imm32.NewProc("ImmGetContext")
 	ImmReleaseContext        = Imm32.NewProc("ImmReleaseContext")
 	ImmGetCompositionStringW = Imm32.NewProc("ImmGetCompositionStringW")
+	DwmSetWindowAttribute    = Dwmapi.NewProc("DwmSetWindowAttribute")
 
 	// ConPTY and process APIs are exported by Kernel32 on supported Windows versions.
 	CreatePseudoConsole               = Kernel32.NewProc("CreatePseudoConsole")

@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode/utf16"
@@ -29,10 +30,8 @@ const (
 	wsClipChildren     = 0x02000000
 	wsVisible          = 0x10000000
 	wsChild            = 0x40000000
-	wsBorder           = 0x00800000
 	wsTabStop          = 0x00010000
 	esAutoHScroll      = 0x0080
-	bsPushButton       = 0
 	ssLeft             = 0
 	wmCreate           = 0x0001
 	wmDestroy          = 0x0002
@@ -45,8 +44,13 @@ const (
 	wmTimer            = 0x0113
 	wmPaint            = 0x000F
 	wmSetIcon          = 0x0080
+	wmSetFont          = 0x0030
+	wmEraseBkgnd       = 0x0014
+	wmDrawItem         = 0x002B
+	wmCtlColorEdit     = 0x0133
 	wmCtlColorStatic   = 0x0138
 	wmMouseMove        = 0x0200
+	wmMouseLeave       = 0x02A3
 	wmLButtonDown      = 0x0201
 	wmLButtonUp        = 0x0202
 	wmRButtonUp        = 0x0205
@@ -78,12 +82,56 @@ const (
 
 	cellWidth     = 10
 	cellHeight    = 20
-	toolbarHeight = 48
+	toolbarHeight = 56
 	terminalBG    = 0x001E1E1E // COLORREF for the terminal background.
 	cursorBorder  = 0x00A0A0A0 // COLORREF for the cursor outline.
 	srcCopy       = 0x00CC0020
 	selectionBG   = 0x01A56E2B // Tagged RGB: #A56E2B.
 	selectionFG   = 0x01FFFFFF // Tagged RGB: #FFFFFF.
+)
+
+// Toolbar palette: a lifted dark surface above the terminal, blue for the
+// primary action, red reserved for the destructive Disconnect action.
+const (
+	toolbarBG        = 0x002A2626 // #26262A
+	toolbarSeparator = 0x00171515 // #151517
+	inputBG          = 0x001E1B1B // #1B1B1E
+	inputBorder      = 0x00463F3F // #3F3F46
+	inputFocusBorder = 0x00FF8D4C // #4C8DFF
+	accentFill       = 0x00EB6F1F // #1F6FEB
+	accentHover      = 0x00F7812F // #2F81F7
+	accentPressed    = 0x00D05F1A // #1A5FD0
+	neutralFill      = 0x00383232 // #323238
+	neutralHover     = 0x00463E3E // #3E3E46
+	neutralPressed   = 0x00302A2A // #2A2A30
+	neutralBorder    = 0x00524A4A // #4A4A52
+	dangerText       = 0x004951F8 // #F85149
+	dangerHoverFill  = 0x0026243D // #3D2426
+	textPrimary      = 0x00FCF6F0 // #F0F6FC
+	textSecondary    = 0x00B3A79D // #9DA7B3
+	textDisabled     = 0x0081766E // #6E7681
+	disabledFill     = 0x00302A2A // #2A2A30
+	disabledBorder   = 0x003E3A3A // #3A3A3E
+	statusIdleColor  = 0x0081766E // #6E7681
+	statusOKColor    = 0x0050B93F // #3FB950
+	statusBusyColor  = 0x002299D2 // #D29922
+	statusErrColor   = 0x004951F8 // #F85149
+	focusRingColor   = 0x00FFA658 // #58A6FF
+)
+
+const (
+	bsOwnerDraw         = 0x000B
+	ssCenterImage       = 0x0200
+	odsSelected         = 0x0001
+	odsDisabled         = 0x0004
+	odsFocus            = 0x0010
+	odtButton           = 4
+	tmeLeave            = 0x0002
+	emSetCueBanner      = 0x1501
+	enSetFocus          = 0x0100
+	enKillFocus         = 0x0200
+	gwlpWndProc         = ^uintptr(3) // GWLP_WNDPROC
+	drawTextButtonFlags = 0x0825      // DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX
 )
 
 type point struct{ X, Y int32 }
@@ -109,6 +157,20 @@ type wndClassEx struct {
 	Instance, Icon, Cursor, Background uintptr
 	MenuName, ClassName                *uint16
 	IconSm                             uintptr
+}
+type drawItemStruct struct {
+	CtlType, CtlID        uint32
+	ItemID                uint32
+	ItemAction, ItemState uint32
+	HwndItem              uintptr
+	Hdc                   uintptr
+	RcItem                rect
+	ItemData              uintptr
+}
+type trackMouseEventStruct struct {
+	CbSize, DwFlags uint32
+	HwndTrack       uintptr
+	DwHoverTime     uint32
 }
 
 type pendingInput struct {
@@ -147,6 +209,12 @@ var (
 	lastHeartbeat                                               time.Time
 	terminalFont                                                uintptr
 	cjkFont                                                     uintptr
+	uiFont, uiFontBold                                          uintptr
+	hostFocused                                                 bool
+	hoverHwnd                                                   uintptr
+	origButtonProc                                              uintptr
+	buttonProcCallback                                          uintptr
+	statusKind                                                  atomic.Int32
 	toolbarBrush                                                uintptr
 	backDC                                                      uintptr
 	backBitmap                                                  uintptr
@@ -223,10 +291,13 @@ func resetCursorBlink(hwnd uintptr) {
 	invalidateCursor(hwnd)
 }
 
-func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
+func windowProc(hwnd uintptr, message uint32, wParam uintptr, lp unsafe.Pointer) uintptr {
+	lParam := uintptr(lp)
 	switch message {
 	case wmCreate:
 		telemetryf("window_message wm_create_begin")
+		darkTitleBar := int32(1)
+		winapi.DwmSetWindowAttribute.Call(hwnd, 20, uintptr(unsafe.Pointer(&darkTitleBar)), unsafe.Sizeof(darkTitleBar)) // DWMWA_USE_IMMERSIVE_DARK_MODE
 		if appIcon != 0 {
 			winapi.User32.NewProc("SendMessageW").Call(hwnd, wmSetIcon, iconBig, appIcon)
 		}
@@ -237,8 +308,18 @@ func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 		terminalFont, _, _ = winapi.CreateFontW.Call(^uintptr(15), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0x31, uintptr(unsafe.Pointer(fontName)))
 		cjkFontName := syscall.StringToUTF16Ptr("Microsoft YaHei")
 		cjkFont, _, _ = winapi.CreateFontW.Call(^uintptr(15), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, uintptr(unsafe.Pointer(cjkFontName)))
-		toolbarBrush, _, _ = winapi.CreateSolidBrush.Call(0x001E1E1E)
+		toolbarBrush, _, _ = winapi.CreateSolidBrush.Call(toolbarBG)
+		uiFont = createUIFont(400)
+		uiFontBold = createUIFont(600)
 		createToolbar(hwnd)
+		sendMessage := winapi.User32.NewProc("SendMessageW")
+		sendMessage.Call(hostEdit, wmSetFont, uiFont, 1)
+		sendMessage.Call(statusLabel, wmSetFont, uiFont, 1)
+		cueText := syscall.StringToUTF16Ptr("user@host[:port]")
+		sendMessage.Call(hostEdit, emSetCueBanner, 1, uintptr(unsafe.Pointer(cueText)))
+		subclassButton(connectButton)
+		subclassButton(disconnectButton)
+		subclassButton(powerShellButton)
 		winapi.User32.NewProc("SetTimer").Call(hwnd, timerIDHeartbeat, 1000, 0)
 		blinkTime, _, _ := winapi.User32.NewProc("GetCaretBlinkTime").Call()
 		if blinkTime == 0 || blinkTime > 2000 {
@@ -297,8 +378,17 @@ func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 		controlID := uint16(wParam)
 		notifyCode := uint16(wParam >> 16)
 		if controlID == idHost {
-			if notifyCode == enChange {
+			switch notifyCode {
+			case enChange:
 				telemetryf("host_edit_change")
+			case enSetFocus, enKillFocus:
+				hostFocused = notifyCode == enSetFocus
+				frame := hostFrameRect()
+				frame.Left--
+				frame.Top--
+				frame.Right++
+				frame.Bottom++
+				winapi.User32.NewProc("InvalidateRect").Call(hwnd, uintptr(unsafe.Pointer(&frame)), 0)
 			}
 			return 0
 		}
@@ -371,11 +461,24 @@ func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 		paint(hwnd)
 		telemetryf("window_message wm_paint_end")
 		return 0
+	case wmEraseBkgnd:
+		return 1 // paint covers the full client area, including the toolbar.
+	case wmCtlColorEdit:
+		hdc := wParam
+		winapi.SetTextColor.Call(hdc, textPrimary)
+		winapi.SetBkColor.Call(hdc, inputBG)
+		return brushRef(inputBG)
 	case wmCtlColorStatic:
 		hdc := wParam
-		winapi.SetTextColor.Call(hdc, 0x00D0D0D0)
-		winapi.SetBkColor.Call(hdc, 0x001E1E1E)
+		winapi.SetTextColor.Call(hdc, textSecondary)
+		winapi.SetBkColor.Call(hdc, toolbarBG)
 		return toolbarBrush
+	case wmDrawItem:
+		dis := (*drawItemStruct)(lp)
+		if dis.CtlType == odtButton {
+			drawToolbarButton(dis)
+			return 1
+		}
 	case wmTimer:
 		switch wParam {
 		case timerIDHeartbeat:
@@ -405,6 +508,14 @@ func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 		if cjkFont != 0 {
 			winapi.DeleteObject.Call(cjkFont)
 			cjkFont = 0
+		}
+		if uiFont != 0 {
+			winapi.DeleteObject.Call(uiFont)
+			uiFont = 0
+		}
+		if uiFontBold != 0 {
+			winapi.DeleteObject.Call(uiFontBold)
+			uiFontBold = 0
 		}
 		if toolbarBrush != 0 {
 			winapi.DeleteObject.Call(toolbarBrush)
@@ -597,11 +708,12 @@ func createToolbar(hwnd uintptr) {
 	disconnectText := syscall.StringToUTF16Ptr("Disconnect")
 	powerShellText := syscall.StringToUTF16Ptr("PowerShell")
 	statusText := syscall.StringToUTF16Ptr("Not connected")
-	hostEdit, _, _ = create.Call(0, uintptr(unsafe.Pointer(hostClass)), uintptr(unsafe.Pointer(hostText)), wsChild|wsVisible|wsBorder|wsTabStop|esAutoHScroll, 12, 10, 300, 26, hwnd, idHost, 0, 0)
-	connectButton, _, _ = create.Call(0, uintptr(unsafe.Pointer(buttonClass)), uintptr(unsafe.Pointer(connectText)), wsChild|wsVisible|wsTabStop|bsPushButton, 322, 10, 88, 26, hwnd, idConnect, 0, 0)
-	disconnectButton, _, _ = create.Call(0, uintptr(unsafe.Pointer(buttonClass)), uintptr(unsafe.Pointer(disconnectText)), wsChild|wsVisible|wsTabStop|bsPushButton, 418, 10, 96, 26, hwnd, idDisconnect, 0, 0)
-	powerShellButton, _, _ = create.Call(0, uintptr(unsafe.Pointer(buttonClass)), uintptr(unsafe.Pointer(powerShellText)), wsChild|wsVisible|wsTabStop|bsPushButton, 522, 10, 96, 26, hwnd, idPowerShell, 0, 0)
-	statusLabel, _, _ = create.Call(0, uintptr(unsafe.Pointer(staticClass)), uintptr(unsafe.Pointer(statusText)), wsChild|wsVisible|ssLeft, 626, 14, 330, 22, hwnd, idStatus, 0, 0)
+	hostEdit, _, _ = create.Call(0, uintptr(unsafe.Pointer(hostClass)), uintptr(unsafe.Pointer(hostText)), wsChild|wsVisible|wsTabStop|esAutoHScroll, 20, 16, 304, 24, hwnd, idHost, 0, 0)
+	connectButton, _, _ = create.Call(0, uintptr(unsafe.Pointer(buttonClass)), uintptr(unsafe.Pointer(connectText)), wsChild|wsVisible|wsTabStop|bsOwnerDraw, 344, 12, 96, 32, hwnd, idConnect, 0, 0)
+	disconnectButton, _, _ = create.Call(0, uintptr(unsafe.Pointer(buttonClass)), uintptr(unsafe.Pointer(disconnectText)), wsChild|wsVisible|wsTabStop|bsOwnerDraw, 448, 12, 104, 32, hwnd, idDisconnect, 0, 0)
+	powerShellButton, _, _ = create.Call(0, uintptr(unsafe.Pointer(buttonClass)), uintptr(unsafe.Pointer(powerShellText)), wsChild|wsVisible|wsTabStop|bsOwnerDraw, 560, 12, 104, 32, hwnd, idPowerShell, 0, 0)
+	statusLabel, _, _ = create.Call(0, uintptr(unsafe.Pointer(staticClass)), uintptr(unsafe.Pointer(statusText)), wsChild|wsVisible|ssLeft|ssCenterImage, 694, 12, 330, 32, hwnd, idStatus, 0, 0)
+	updateToolbarState()
 }
 
 func layoutToolbar(hwnd uintptr, width, height int32) {
@@ -609,20 +721,193 @@ func layoutToolbar(hwnd uintptr, width, height int32) {
 		return
 	}
 	move := winapi.User32.NewProc("MoveWindow")
-	statusWidth := width - 638
+	statusWidth := width - 706
 	if statusWidth < 80 {
 		statusWidth = 80
 	}
-	move.Call(hostEdit, 12, 10, 300, 26, 1)
-	move.Call(connectButton, 322, 10, 88, 26, 1)
-	move.Call(disconnectButton, 418, 10, 96, 26, 1)
-	move.Call(powerShellButton, 522, 10, 96, 26, 1)
-	move.Call(statusLabel, 626, 14, uintptr(statusWidth), 22, 1)
-	_ = hwnd
+	move.Call(hostEdit, 20, 16, 304, 24, 1)
+	move.Call(connectButton, 344, 12, 96, 32, 1)
+	move.Call(disconnectButton, 448, 12, 104, 32, 1)
+	move.Call(powerShellButton, 560, 12, 104, 32, 1)
+	move.Call(statusLabel, 694, 12, uintptr(statusWidth), 32, 1)
+	tb := rect{Left: 0, Top: 0, Right: width, Bottom: toolbarHeight}
+	winapi.User32.NewProc("InvalidateRect").Call(hwnd, uintptr(unsafe.Pointer(&tb)), 0)
 	_ = height
 }
 
+func hostFrameRect() rect { return rect{Left: 12, Top: 12, Right: 332, Bottom: 44} }
+func statusDotRect() rect { return rect{Left: 678, Top: 24, Right: 686, Bottom: 32} }
+
+func createUIFont(weight uintptr) uintptr {
+	name := syscall.StringToUTF16Ptr("Segoe UI")
+	font, _, _ := winapi.CreateFontW.Call(^uintptr(13), 0, 0, 0, weight, 0, 0, 0, 1, 0, 0, 5, 0, uintptr(unsafe.Pointer(name)))
+	return font
+}
+
+// fillRoundRect draws a rounded panel; ellipse is the corner diameter in pixels.
+func fillRoundRect(hdc uintptr, rc rect, fill, border uint32, penWidth, ellipse int32) {
+	pen, _, _ := winapi.CreatePen.Call(0, uintptr(penWidth), uintptr(border))
+	oldPen, _, _ := winapi.SelectObject.Call(hdc, pen)
+	oldBrush, _, _ := winapi.SelectObject.Call(hdc, brushRef(fill))
+	winapi.RoundRect.Call(hdc, uintptr(rc.Left), uintptr(rc.Top), uintptr(rc.Right), uintptr(rc.Bottom), uintptr(ellipse), uintptr(ellipse))
+	winapi.SelectObject.Call(hdc, oldBrush)
+	winapi.SelectObject.Call(hdc, oldPen)
+	winapi.DeleteObject.Call(pen)
+}
+
+func paintToolbar(hdc uintptr, width int32) {
+	tb := rect{Left: 0, Top: 0, Right: width, Bottom: toolbarHeight}
+	winapi.FillRect.Call(hdc, uintptr(unsafe.Pointer(&tb)), brushRef(toolbarBG))
+	sep := rect{Left: 0, Top: toolbarHeight - 1, Right: width, Bottom: toolbarHeight}
+	winapi.FillRect.Call(hdc, uintptr(unsafe.Pointer(&sep)), brushRef(toolbarSeparator))
+	border, penWidth := uint32(inputBorder), int32(1)
+	if hostFocused {
+		border, penWidth = inputFocusBorder, 2
+	}
+	fillRoundRect(hdc, hostFrameRect(), inputBG, border, penWidth, 12)
+	dot := statusDotRect()
+	oldPen, _, _ := winapi.SelectObject.Call(hdc, nullPen())
+	oldBrush, _, _ := winapi.SelectObject.Call(hdc, brushRef(statusDotColor()))
+	winapi.Ellipse.Call(hdc, uintptr(dot.Left), uintptr(dot.Top), uintptr(dot.Right), uintptr(dot.Bottom))
+	winapi.SelectObject.Call(hdc, oldBrush)
+	winapi.SelectObject.Call(hdc, oldPen)
+}
+
+func nullPen() uintptr {
+	pen, _, _ := winapi.GetStockObject.Call(8) // NULL_PEN
+	return pen
+}
+
+func nullBrush() uintptr {
+	brush, _, _ := winapi.GetStockObject.Call(5) // NULL_BRUSH
+	return brush
+}
+
+func drawToolbarButton(dis *drawItemStruct) {
+	hdc := dis.Hdc
+	rc := dis.RcItem
+	winapi.FillRect.Call(hdc, uintptr(unsafe.Pointer(&rc)), toolbarBrush)
+	disabled := dis.ItemState&odsDisabled != 0
+	pressed := dis.ItemState&odsSelected != 0
+	hovered := hoverHwnd == dis.HwndItem && !disabled
+	var fill, border, text uint32
+	var label string
+	switch dis.CtlID {
+	case idConnect:
+		label = "Connect"
+		fill, border, text = accentFill, accentFill, textPrimary
+		if pressed {
+			fill, border = accentPressed, accentPressed
+		} else if hovered {
+			fill, border = accentHover, accentHover
+		}
+	case idDisconnect:
+		label = "Disconnect"
+		fill, border, text = neutralFill, neutralBorder, dangerText
+		if pressed {
+			fill = neutralPressed
+		} else if hovered {
+			fill, border = dangerHoverFill, dangerText
+		}
+	case idPowerShell:
+		label = "PowerShell"
+		fill, border, text = neutralFill, neutralBorder, textPrimary
+		if pressed {
+			fill = neutralPressed
+		} else if hovered {
+			fill = neutralHover
+		}
+	default:
+		return
+	}
+	if disabled {
+		fill, border, text = disabledFill, disabledBorder, textDisabled
+	}
+	fillRoundRect(hdc, rc, fill, border, 1, 12)
+	font := uiFont
+	if dis.CtlID == idConnect && !disabled {
+		font = uiFontBold
+	}
+	var oldFont uintptr
+	if font != 0 {
+		oldFont, _, _ = winapi.SelectObject.Call(hdc, font)
+	}
+	winapi.SetTextColor.Call(hdc, uintptr(text))
+	winapi.SetBkMode.Call(hdc, 1)
+	textRc := rc
+	p := syscall.StringToUTF16Ptr(label)
+	winapi.DrawTextW.Call(hdc, uintptr(unsafe.Pointer(p)), ^uintptr(0), uintptr(unsafe.Pointer(&textRc)), drawTextButtonFlags)
+	if oldFont != 0 {
+		winapi.SelectObject.Call(hdc, oldFont)
+	}
+	if dis.ItemState&odsFocus != 0 && !disabled {
+		ringColor := uint32(focusRingColor)
+		if dis.CtlID == idConnect {
+			ringColor = 0x00FFFFFF
+		}
+		ring := rect{Left: rc.Left + 3, Top: rc.Top + 3, Right: rc.Right - 3, Bottom: rc.Bottom - 3}
+		pen, _, _ := winapi.CreatePen.Call(0, 1, uintptr(ringColor))
+		oldPen, _, _ := winapi.SelectObject.Call(hdc, pen)
+		oldBrush, _, _ := winapi.SelectObject.Call(hdc, nullBrush())
+		winapi.RoundRect.Call(hdc, uintptr(ring.Left), uintptr(ring.Top), uintptr(ring.Right), uintptr(ring.Bottom), 8, 8)
+		winapi.SelectObject.Call(hdc, oldBrush)
+		winapi.SelectObject.Call(hdc, oldPen)
+		winapi.DeleteObject.Call(pen)
+	}
+}
+
+// subclassButton adds hover tracking to an owner-draw BUTTON while keeping the
+// native click, keyboard, and notification behavior.
+func subclassButton(hwnd uintptr) {
+	if buttonProcCallback == 0 {
+		buttonProcCallback = syscall.NewCallback(buttonSubclassProc)
+	}
+	prev, _, _ := winapi.User32.NewProc("SetWindowLongPtrW").Call(hwnd, gwlpWndProc, buttonProcCallback)
+	if origButtonProc == 0 {
+		origButtonProc = prev
+	}
+}
+
+func buttonSubclassProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
+	switch message {
+	case wmMouseMove:
+		if hoverHwnd != hwnd {
+			hoverHwnd = hwnd
+			var tme trackMouseEventStruct
+			tme.CbSize = uint32(unsafe.Sizeof(tme))
+			tme.DwFlags = tmeLeave
+			tme.HwndTrack = hwnd
+			winapi.User32.NewProc("TrackMouseEvent").Call(uintptr(unsafe.Pointer(&tme)))
+			winapi.User32.NewProc("InvalidateRect").Call(hwnd, 0, 0)
+		}
+	case wmMouseLeave:
+		if hoverHwnd == hwnd {
+			hoverHwnd = 0
+			winapi.User32.NewProc("InvalidateRect").Call(hwnd, 0, 0)
+		}
+	}
+	r, _, _ := winapi.User32.NewProc("CallWindowProcW").Call(origButtonProc, hwnd, uintptr(message), wParam, lParam)
+	return r
+}
+
+func updateToolbarState() {
+	connected := hasSession()
+	hoverHwnd = 0
+	enable := winapi.User32.NewProc("EnableWindow")
+	set := func(hwnd uintptr, on bool) {
+		v := uintptr(0)
+		if on {
+			v = 1
+		}
+		enable.Call(hwnd, v)
+	}
+	set(connectButton, !connected)
+	set(powerShellButton, !connected)
+	set(disconnectButton, connected)
+}
+
 func setStatus(value string) {
+	statusKind.Store(classifyStatus(value))
 	if statusLabel != 0 {
 		p, err := syscall.UTF16PtrFromString(value)
 		if err == nil {
@@ -630,6 +915,46 @@ func setStatus(value string) {
 			winapi.User32.NewProc("InvalidateRect").Call(statusLabel, 0, 1)
 			winapi.User32.NewProc("UpdateWindow").Call(statusLabel)
 		}
+	}
+	if mainHwnd != 0 {
+		dot := statusDotRect()
+		winapi.User32.NewProc("InvalidateRect").Call(mainHwnd, uintptr(unsafe.Pointer(&dot)), 0)
+	}
+}
+
+const (
+	statusIdle int32 = iota
+	statusBusy
+	statusConnected
+	statusError
+)
+
+func classifyStatus(value string) int32 {
+	s := strings.ToLower(value)
+	switch {
+	case strings.Contains(s, "not connected"), strings.Contains(s, "disconnected"):
+		return statusIdle
+	case strings.Contains(s, "connecting"), strings.Contains(s, "starting"), strings.HasPrefix(s, "enter"):
+		return statusBusy
+	case strings.Contains(s, "connected"):
+		return statusConnected
+	case strings.Contains(s, "failed"), strings.Contains(s, "unavailable"), strings.Contains(s, "ended"), strings.Contains(s, "exited"), strings.Contains(s, "full"), strings.Contains(s, "closed"), strings.Contains(s, "error"):
+		return statusError
+	default:
+		return statusIdle
+	}
+}
+
+func statusDotColor() uint32 {
+	switch statusKind.Load() {
+	case statusBusy:
+		return statusBusyColor
+	case statusConnected:
+		return statusOKColor
+	case statusError:
+		return statusErrColor
+	default:
+		return statusIdleColor
 	}
 }
 
@@ -707,6 +1032,7 @@ func startSession(hwnd uintptr, label, pendingStatus, connectedStatus, executabl
 	session = s
 	sessionMu.Unlock()
 	setStatus(connectedStatus)
+	updateToolbarState()
 	winapi.User32.NewProc("SetFocus").Call(hwnd)
 	resetCursorBlink(hwnd)
 	go readSessionOutput(s, hwnd, label)
@@ -754,6 +1080,7 @@ func readSessionOutput(s *sshclient.Session, hwnd uintptr, label string) {
 	if !current {
 		return
 	} // A manual disconnect already owns shutdown/status.
+	updateToolbarState()
 	code, waitErr := s.Wait()
 	inputWriteMu.Lock()
 	_ = s.Close()
@@ -833,6 +1160,7 @@ func disconnectSession(status string) {
 		winapi.User32.NewProc("InvalidateRect").Call(mainHwnd, 0, 0)
 	}
 	setStatus(status)
+	updateToolbarState()
 }
 
 func keySequence(key uintptr) []byte {
@@ -961,8 +1289,8 @@ func paint(hwnd uintptr) {
 	if clip.Left < 0 {
 		clip.Left = 0
 	}
-	if clip.Top < toolbarHeight {
-		clip.Top = toolbarHeight
+	if clip.Top < 0 {
+		clip.Top = 0
 	}
 	if clip.Right > rc.Right {
 		clip.Right = rc.Right
@@ -971,7 +1299,7 @@ func paint(hwnd uintptr) {
 		clip.Bottom = rc.Bottom
 	}
 	if fresh {
-		clip = rect{Left: 0, Top: toolbarHeight, Right: rc.Right, Bottom: rc.Bottom}
+		clip = rect{Left: 0, Top: 0, Right: rc.Right, Bottom: rc.Bottom}
 	}
 	if clip.Right <= clip.Left || clip.Bottom <= clip.Top {
 		winapi.EndPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
@@ -979,95 +1307,110 @@ func paint(hwnd uintptr) {
 	}
 	// Render off-screen and blit once: the window must never show a frame that
 	// has only been cleared while streamed output is loading.
-	winapi.IntersectClipRect.Call(hdc, uintptr(clip.Left), uintptr(clip.Top), uintptr(clip.Right), uintptr(clip.Bottom))
-	brush := brushRef(terminalBG)
-	termRect := rect{Left: 0, Top: toolbarHeight, Right: rc.Right, Bottom: rc.Bottom}
-	winapi.FillRect.Call(hdc, uintptr(unsafe.Pointer(&termRect)), brush)
-	winapi.SetBkMode.Call(hdc, 1)
-	var previousFont uintptr
-	if terminalFont != 0 {
-		previousFont, _, _ = winapi.SelectObject.Call(hdc, terminalFont)
-	}
-	screenMu.Lock()
-	for y := 0; y < screen.Height; y++ {
-		for x := 0; x < screen.Width; {
-			cell := screen.Cells[y][x]
-			selected := selection.active && isSelected(y*screen.Width+x)
-			if selected {
-				cell.BG, cell.FG, cell.Faint = selectionBG, selectionFG, false
-			}
-			end := x + 1
-			for end < screen.Width {
-				next := screen.Cells[y][end]
-				if selection.active && isSelected(y*screen.Width+end) {
-					next.BG, next.FG, next.Faint = selectionBG, selectionFG, false
-				}
-				if next.FG != cell.FG || next.BG != cell.BG || next.Faint != cell.Faint {
-					break
-				}
-				end++
-			}
-			left := int32(12 + x*cellWidth)
-			top := int32(toolbarHeight + 6 + y*cellHeight)
-			background := rect{Left: left, Top: top, Right: left + int32((end-x)*cellWidth), Bottom: top + cellHeight}
-			cellBrush := brushRef(colorRef(cell.BG))
-			winapi.FillRect.Call(hdc, uintptr(unsafe.Pointer(&background)), cellBrush)
-			runs++
-			cells += end - x
-			line := make([]uint16, 0, end-x)
-			dx := make([]int32, 0, end-x)
-			for i := x; i < end; i++ {
-				r := screen.Cells[y][i].Rune
-				if r == 0 {
-					if i > 0 && term.RuneWidth(screen.Cells[y][i-1].Rune) == 2 {
-						continue // continuation cell of the preceding wide glyph
-					}
-					r = ' '
-				}
-				if r > 0xFFFF {
-					r = '?'
-				}
-				line = append(line, uint16(r))
-				dx = append(dx, int32(cellWidth*term.RuneWidth(r)))
-			}
-			fgColor := colorRef(cell.FG)
-			if cell.Faint {
-				fgColor = term.DimColorRef(cell.FG)
-			}
-			winapi.SetTextColor.Call(hdc, uintptr(fgColor))
-			drawGlyphRuns(hdc, left, top, &background, line, dx)
-			x = end
+	if clip.Top < toolbarHeight {
+		tbClip := clip
+		if tbClip.Bottom > toolbarHeight {
+			tbClip.Bottom = toolbarHeight
 		}
+		winapi.IntersectClipRect.Call(hdc, uintptr(tbClip.Left), uintptr(tbClip.Top), uintptr(tbClip.Right), uintptr(tbClip.Bottom))
+		paintToolbar(hdc, rc.Right)
+		winapi.SelectClipRgn.Call(hdc, 0)
 	}
-	curX, curY := screen.X, screen.Y
-	cursorVisible := screen.CursorVisible
-	screenMu.Unlock()
-	sessionMu.Lock()
-	hasSession := session != nil
-	sessionMu.Unlock()
-	focused, _, _ := winapi.User32.NewProc("GetFocus").Call()
-	isFocused := focused == hwnd
+	if clip.Bottom > toolbarHeight {
+		termClip := clip
+		if termClip.Top < toolbarHeight {
+			termClip.Top = toolbarHeight
+		}
+		winapi.IntersectClipRect.Call(hdc, uintptr(termClip.Left), uintptr(termClip.Top), uintptr(termClip.Right), uintptr(termClip.Bottom))
+		brush := brushRef(terminalBG)
+		termRect := rect{Left: 0, Top: toolbarHeight, Right: rc.Right, Bottom: rc.Bottom}
+		winapi.FillRect.Call(hdc, uintptr(unsafe.Pointer(&termRect)), brush)
+		winapi.SetBkMode.Call(hdc, 1)
+		var previousFont uintptr
+		if terminalFont != 0 {
+			previousFont, _, _ = winapi.SelectObject.Call(hdc, terminalFont)
+		}
+		screenMu.Lock()
+		for y := 0; y < screen.Height; y++ {
+			for x := 0; x < screen.Width; {
+				cell := screen.Cells[y][x]
+				selected := selection.active && isSelected(y*screen.Width+x)
+				if selected {
+					cell.BG, cell.FG, cell.Faint = selectionBG, selectionFG, false
+				}
+				end := x + 1
+				for end < screen.Width {
+					next := screen.Cells[y][end]
+					if selection.active && isSelected(y*screen.Width+end) {
+						next.BG, next.FG, next.Faint = selectionBG, selectionFG, false
+					}
+					if next.FG != cell.FG || next.BG != cell.BG || next.Faint != cell.Faint {
+						break
+					}
+					end++
+				}
+				left := int32(12 + x*cellWidth)
+				top := int32(toolbarHeight + 6 + y*cellHeight)
+				background := rect{Left: left, Top: top, Right: left + int32((end-x)*cellWidth), Bottom: top + cellHeight}
+				cellBrush := brushRef(colorRef(cell.BG))
+				winapi.FillRect.Call(hdc, uintptr(unsafe.Pointer(&background)), cellBrush)
+				runs++
+				cells += end - x
+				line := make([]uint16, 0, end-x)
+				dx := make([]int32, 0, end-x)
+				for i := x; i < end; i++ {
+					r := screen.Cells[y][i].Rune
+					if r == 0 {
+						if i > 0 && term.RuneWidth(screen.Cells[y][i-1].Rune) == 2 {
+							continue // continuation cell of the preceding wide glyph
+						}
+						r = ' '
+					}
+					if r > 0xFFFF {
+						r = '?'
+					}
+					line = append(line, uint16(r))
+					dx = append(dx, int32(cellWidth*term.RuneWidth(r)))
+				}
+				fgColor := colorRef(cell.FG)
+				if cell.Faint {
+					fgColor = term.DimColorRef(cell.FG)
+				}
+				winapi.SetTextColor.Call(hdc, uintptr(fgColor))
+				drawGlyphRuns(hdc, left, top, &background, line, dx)
+				x = end
+			}
+		}
+		curX, curY := screen.X, screen.Y
+		cursorVisible := screen.CursorVisible
+		screenMu.Unlock()
+		sessionMu.Lock()
+		hasSession := session != nil
+		sessionMu.Unlock()
+		focused, _, _ := winapi.User32.NewProc("GetFocus").Call()
+		isFocused := focused == hwnd
 
-	if curX >= screen.Width {
-		curX = screen.Width - 1
-	}
-	if curY >= screen.Height {
-		curY = screen.Height - 1
-	}
+		if curX >= screen.Width {
+			curX = screen.Width - 1
+		}
+		if curY >= screen.Height {
+			curY = screen.Height - 1
+		}
 
-	showCursor := hasSession && cursorVisible && ((isFocused && cursorBlinkOn) || (!isFocused && true))
-	if showCursor && curX >= 0 && curY >= 0 {
-		cLeft := int32(12 + curX*cellWidth)
-		cTop := int32(toolbarHeight + 6 + curY*cellHeight)
-		cursorRc := rect{Left: cLeft, Top: cTop, Right: cLeft + cellWidth, Bottom: cTop + cellHeight}
-		cursorBrush := brushRef(cursorBorder)
-		winapi.FrameRect.Call(hdc, uintptr(unsafe.Pointer(&cursorRc)), cursorBrush)
-		lastCursorRc = cursorRc
+		showCursor := hasSession && cursorVisible && ((isFocused && cursorBlinkOn) || (!isFocused && true))
+		if showCursor && curX >= 0 && curY >= 0 {
+			cLeft := int32(12 + curX*cellWidth)
+			cTop := int32(toolbarHeight + 6 + curY*cellHeight)
+			cursorRc := rect{Left: cLeft, Top: cTop, Right: cLeft + cellWidth, Bottom: cTop + cellHeight}
+			cursorBrush := brushRef(cursorBorder)
+			winapi.FrameRect.Call(hdc, uintptr(unsafe.Pointer(&cursorRc)), cursorBrush)
+			lastCursorRc = cursorRc
+		}
+		if previousFont != 0 {
+			winapi.SelectObject.Call(hdc, previousFont)
+		}
+		winapi.SelectClipRgn.Call(hdc, 0)
 	}
-	if previousFont != 0 {
-		winapi.SelectObject.Call(hdc, previousFont)
-	}
-	winapi.SelectClipRgn.Call(hdc, 0)
 	winapi.BitBlt.Call(windowDC, uintptr(clip.Left), uintptr(clip.Top), uintptr(clip.Right-clip.Left), uintptr(clip.Bottom-clip.Top), hdc, uintptr(clip.Left), uintptr(clip.Top), srcCopy)
 	winapi.EndPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
 	elapsed := time.Since(paintStarted)

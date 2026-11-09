@@ -28,7 +28,7 @@ go build ./...
 go build -ldflags "-H=windowsgui" -o .\\terminal.exe .\\cmd\\terminal
 ```
 
-The `-H=windowsgui` flag is required: without it the linker produces a console-subsystem executable, which opens an extra console window. The app icon (`terminal.ico`) is compiled into `cmd/terminal/rsrc_windows_amd64.syso`, which is kept in the source tree so regular builds need no resource tool. Regenerate it only after changing the icon, with LLVM-MinGW or any Win32 `windres`:
+The `-H=windowsgui` flag is required: without it the linker produces a console-subsystem executable, which opens an extra console window. The app icon (`terminal.ico`) and the common-controls v6 manifest (`terminal.manifest`, needed for the host field's placeholder text) are compiled into `cmd/terminal/rsrc_windows_amd64.syso`, which is kept in the source tree so regular builds need no resource tool. Regenerate it only after changing the icon or manifest, with LLVM-MinGW or any Win32 `windres`:
 
 ```powershell
 cd .\\cmd\\terminal
