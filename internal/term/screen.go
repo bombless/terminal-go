@@ -4,6 +4,7 @@ package term
 type Cell struct {
 	Rune   rune
 	FG, BG uint32
+	Faint  bool
 }
 
 // Screen stores a fixed-size terminal grid.
@@ -12,6 +13,7 @@ type Screen struct {
 	Cells         [][]Cell
 	X, Y          int
 	FG, BG        uint32
+	Faint         bool
 	CursorVisible bool
 }
 
@@ -32,7 +34,9 @@ func NewScreen(width, height int) *Screen {
 	}
 	return s
 }
-func (s *Screen) blankCell() Cell { return Cell{Rune: ' ', FG: s.FG, BG: s.BG} }
+func (s *Screen) blankCell() Cell {
+	return Cell{Rune: ' ', FG: s.FG, BG: s.BG, Faint: s.Faint}
+}
 func (s *Screen) Put(r rune) {
 	switch r {
 	case '\r':
@@ -76,9 +80,9 @@ func (s *Screen) Put(r rune) {
 	if width == 2 {
 		s.clearWideAt(s.Y, s.X+1)
 	}
-	s.Cells[s.Y][s.X] = Cell{Rune: r, FG: s.FG, BG: s.BG}
+	s.Cells[s.Y][s.X] = Cell{Rune: r, FG: s.FG, BG: s.BG, Faint: s.Faint}
 	if width == 2 {
-		s.Cells[s.Y][s.X+1] = Cell{Rune: 0, FG: s.FG, BG: s.BG}
+		s.Cells[s.Y][s.X+1] = Cell{Rune: 0, FG: s.FG, BG: s.BG, Faint: s.Faint}
 	}
 	s.X += width
 }

@@ -15,6 +15,20 @@ func TestColorRefANSIPalette(t *testing.T) {
 	}
 }
 
+func TestDimColorRef(t *testing.T) {
+	tests := []struct{ color, want uint32 }{
+		{15, 0x007F7F7F}, // bright white
+		{7, 0x00727272},  // default foreground
+		{1, 0x00000066},  // red
+		{trueColorFlag | 0xFFFFFF, 0x007F7F7F},
+	}
+	for _, tt := range tests {
+		if got := DimColorRef(tt.color); got != tt.want {
+			t.Errorf("DimColorRef(%#08x) = %#08x, want %#08x", tt.color, got, tt.want)
+		}
+	}
+}
+
 func TestColorRefTaggedRGB(t *testing.T) {
 	tests := []struct {
 		name        string

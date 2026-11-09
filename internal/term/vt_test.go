@@ -88,6 +88,29 @@ func TestParserSaveRestoreCursorAndResetColors(t *testing.T) {
 	}
 }
 
+func TestParserFaintAttribute(t *testing.T) {
+	s := NewScreen(8, 2)
+	p := NewParser(s)
+	p.Feed([]byte("\x1b[97;2;3mA\x1b[22mB\x1b[2mC\x1b[0mD"))
+	tests := []struct {
+		x     int
+		r     rune
+		fg    uint32
+		faint bool
+	}{
+		{0, 'A', 15, true},
+		{1, 'B', 7, false},
+		{2, 'C', 7, true},
+		{3, 'D', 7, false},
+	}
+	for _, tt := range tests {
+		cell := s.Cells[0][tt.x]
+		if cell.Rune != tt.r || cell.FG != tt.fg || cell.Faint != tt.faint {
+			t.Errorf("cell %d = %+v, want rune=%q fg=%d faint=%v", tt.x, cell, tt.r, tt.fg, tt.faint)
+		}
+	}
+}
+
 func TestParserDECTCEMCursorVisibility(t *testing.T) {
 	s := NewScreen(8, 2)
 	p := NewParser(s)

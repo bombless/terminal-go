@@ -977,15 +977,15 @@ func paint(hwnd uintptr) {
 			cell := screen.Cells[y][x]
 			selected := selection.active && isSelected(y*screen.Width+x)
 			if selected {
-				cell.BG, cell.FG = selectionBG, selectionFG
+				cell.BG, cell.FG, cell.Faint = selectionBG, selectionFG, false
 			}
 			end := x + 1
 			for end < screen.Width {
 				next := screen.Cells[y][end]
 				if selection.active && isSelected(y*screen.Width+end) {
-					next.BG, next.FG = selectionBG, selectionFG
+					next.BG, next.FG, next.Faint = selectionBG, selectionFG, false
 				}
-				if next.FG != cell.FG || next.BG != cell.BG {
+				if next.FG != cell.FG || next.BG != cell.BG || next.Faint != cell.Faint {
 					break
 				}
 				end++
@@ -1013,7 +1013,11 @@ func paint(hwnd uintptr) {
 				line = append(line, uint16(r))
 				dx = append(dx, int32(cellWidth*term.RuneWidth(r)))
 			}
-			winapi.SetTextColor.Call(hdc, uintptr(colorRef(cell.FG)))
+			fgColor := colorRef(cell.FG)
+			if cell.Faint {
+				fgColor = term.DimColorRef(cell.FG)
+			}
+			winapi.SetTextColor.Call(hdc, uintptr(fgColor))
 			drawGlyphRuns(hdc, left, top, &background, line, dx)
 			x = end
 		}

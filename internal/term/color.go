@@ -22,3 +22,9 @@ func ColorRef(color uint32) uint32 {
 	}
 	return (rgb&0xFF)<<16 | (rgb & 0xFF00) | (rgb>>16)&0xFF
 }
+
+// DimColorRef returns the faint variant of color for SGR 2. Each channel is
+// halved, which matches how dim text reads against a dark background.
+func DimColorRef(color uint32) uint32 {
+	return (ColorRef(color) >> 1) & 0x007F7F7F
+}

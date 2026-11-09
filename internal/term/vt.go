@@ -220,13 +220,17 @@ func (p *Parser) sgr() {
 		switch {
 		case n == 0:
 			p.screen.FG, p.screen.BG, p.bold = 7, 0, false
+			p.screen.Faint = false
 		case n == 1:
 			p.bold = true
 			if p.screen.FG < 8 {
 				p.screen.FG += 8
 			}
+		case n == 2:
+			p.screen.Faint = true
 		case n == 22:
 			p.bold = false
+			p.screen.Faint = false
 			if p.screen.FG >= 8 && p.screen.FG < 16 {
 				p.screen.FG -= 8
 			}
