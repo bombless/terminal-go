@@ -44,6 +44,7 @@ const (
 	wmCommand          = 0x0111
 	wmTimer            = 0x0113
 	wmPaint            = 0x000F
+	wmSetIcon          = 0x0080
 	wmCtlColorStatic   = 0x0138
 	wmMouseMove        = 0x0200
 	wmLButtonDown      = 0x0201
@@ -55,6 +56,15 @@ const (
 	globalMoveable     = 0x0002
 	colorWindow        = 5
 	swShow             = 5
+	imageIcon          = 1
+	lrDefaultSize      = 0x0040
+	lrShared           = 0x8000
+	smCxSmIcon         = 49
+	smCySmIcon         = 50
+	iconSmall          = 0
+	iconBig            = 1
+	iconResourceID     = 1
+	mbIconError        = 0x0010
 
 	idHost           = 1001
 	idConnect        = 1002
@@ -116,6 +126,7 @@ var (
 	className                                                   = syscall.StringToUTF16Ptr("TerminalGoWindow")
 	windowTitle                                                 = syscall.StringToUTF16Ptr("terminal-go - SSH / PowerShell Terminal")
 	mainHwnd                                                    uintptr
+	appIcon, appIconSmall                                       uintptr
 	hostEdit, connectButton, disconnectButton, powerShellButton uintptr
 	statusLabel                                                 uintptr
 	screenMu                                                    sync.Mutex
@@ -216,6 +227,12 @@ func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 	switch message {
 	case wmCreate:
 		telemetryf("window_message wm_create_begin")
+		if appIcon != 0 {
+			winapi.User32.NewProc("SendMessageW").Call(hwnd, wmSetIcon, iconBig, appIcon)
+		}
+		if appIconSmall != 0 {
+			winapi.User32.NewProc("SendMessageW").Call(hwnd, wmSetIcon, iconSmall, appIconSmall)
+		}
 		fontName := syscall.StringToUTF16Ptr("Consolas")
 		terminalFont, _, _ = winapi.CreateFontW.Call(^uintptr(15), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0x31, uintptr(unsafe.Pointer(fontName)))
 		cjkFontName := syscall.StringToUTF16Ptr("Microsoft YaHei")
@@ -1124,6 +1141,24 @@ func init() {
 	runtime.LockOSThread()
 }
 
+// fatal reports startup failures in a dialog because the GUI subsystem has no
+// console where a panic message could be read.
+func fatal(format string, args ...any) {
+	text, _ := syscall.UTF16PtrFromString(fmt.Sprintf(format, args...))
+	caption, _ := syscall.UTF16PtrFromString("terminal-go")
+	winapi.User32.NewProc("MessageBoxW").Call(0, uintptr(unsafe.Pointer(text)), uintptr(unsafe.Pointer(caption)), mbIconError)
+	if telemetryFile != nil {
+		telemetryf("fatal")
+		_ = telemetryFile.Close()
+	}
+	os.Exit(1)
+}
+
+func loadAppIcon(instance uintptr, width, height, flags uintptr) uintptr {
+	icon, _, _ := winapi.User32.NewProc("LoadImageW").Call(instance, iconResourceID, imageIcon, width, height, flags)
+	return icon
+}
+
 func main() {
 	runtime.LockOSThread()
 	winapi.OleInitialize.Call(0)
@@ -1140,18 +1175,22 @@ func main() {
 	telemetryf("main before_get_module_handle")
 	instance, _, _ := winapi.Kernel32.NewProc("GetModuleHandleW").Call(0)
 	telemetryf("main after_get_module_handle instance=%d", instance)
-	wc := wndClassEx{Size: uint32(unsafe.Sizeof(wndClassEx{})), Style: csHRedraw | csVRedraw, WndProc: syscall.NewCallback(windowProc), Instance: instance, Background: colorWindow, ClassName: className}
+	appIcon = loadAppIcon(instance, 0, 0, lrDefaultSize|lrShared)
+	smallCx, _, _ := winapi.User32.NewProc("GetSystemMetrics").Call(smCxSmIcon)
+	smallCy, _, _ := winapi.User32.NewProc("GetSystemMetrics").Call(smCySmIcon)
+	appIconSmall = loadAppIcon(instance, smallCx, smallCy, lrShared)
+	wc := wndClassEx{Size: uint32(unsafe.Sizeof(wndClassEx{})), Style: csHRedraw | csVRedraw, WndProc: syscall.NewCallback(windowProc), Instance: instance, Icon: appIcon, IconSm: appIconSmall, Background: colorWindow, ClassName: className}
 	telemetryf("main before_register_class")
 	if r, _, e := winapi.RegisterClassExW.Call(uintptr(unsafe.Pointer(&wc))); r == 0 {
 		telemetryf("main register_class_failed err=%v", e)
-		panic(e)
+		fatal("Failed to register window class: %v", e)
 	}
 	telemetryf("main after_register_class")
 	telemetryf("main before_create_window")
 	hwnd, _, e := winapi.CreateWindowExW.Call(0, uintptr(unsafe.Pointer(className)), uintptr(unsafe.Pointer(windowTitle)), wsOverlappedWindow|wsClipChildren|wsVisible, 100, 100, 1100, 720, 0, 0, instance, 0)
 	if hwnd == 0 {
 		telemetryf("main create_window_failed err=%v", e)
-		panic(e)
+		fatal("Failed to create window: %v", e)
 	}
 	mainHwnd = hwnd
 	telemetryf("main after_create_window hwnd=%d", hwnd)

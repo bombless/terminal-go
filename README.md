@@ -4,7 +4,7 @@
 
 ## Current status
 
-The Win32 GUI now has a host entry field, Connect/Disconnect controls, a PowerShell button for local sessions, connection status, and a terminal drawing surface. Connect launches `ssh.exe` and PowerShell launches a local `pwsh.exe`, both inside ConPTY. A background reader feeds output chunks into the incremental VT parser; `WM_CHAR` and common navigation keys are forwarded to the ConPTY input pipe; `WM_SIZE` resizes both the screen grid and pseudoconsole. Drag to select terminal text, use `Ctrl+C` to copy selected text, `Ctrl+V` to paste Unicode clipboard text (line endings are converted for the terminal), and `Ctrl+A` to select the visible screen. Right-click opens a Copy/Paste/Select all menu. When no text is selected, `Ctrl+C` remains the remote interrupt key. Screen updates and painting are synchronized. Performance telemetry is written locally to `%APPDATA%\terminal-go\telemetry.log` (or the system temp directory if the config directory is unavailable). It records session output throughput, VT parser time, paint duration/cell and text-run counts, connection startup timing, and slow input writes/queue saturation. It never records terminal contents, clipboard text, or host names.
+`terminal.exe` is a GUI-subsystem program with an embedded multi-size icon, so launching it does not open a console window and the icon appears in Explorer, the taskbar, and the title bar. The Win32 GUI now has a host entry field, Connect/Disconnect controls, a PowerShell button for local sessions, connection status, and a terminal drawing surface. Connect launches `ssh.exe` and PowerShell launches a local `pwsh.exe`, both inside ConPTY. A background reader feeds output chunks into the incremental VT parser; `WM_CHAR` and common navigation keys are forwarded to the ConPTY input pipe; `WM_SIZE` resizes both the screen grid and pseudoconsole. Drag to select terminal text, use `Ctrl+C` to copy selected text, `Ctrl+V` to paste Unicode clipboard text (line endings are converted for the terminal), and `Ctrl+A` to select the visible screen. Right-click opens a Copy/Paste/Select all menu. When no text is selected, `Ctrl+C` remains the remote interrupt key. Screen updates and painting are synchronized. Performance telemetry is written locally to `%APPDATA%\terminal-go\telemetry.log` (or the system temp directory if the config directory is unavailable). It records session output throughput, VT parser time, paint duration/cell and text-run counts, connection startup timing, and slow input writes/queue saturation. It never records terminal contents, clipboard text, or host names.
 
 This is an early interactive slice, not yet a full terminal emulator. Current limitations include basic host-only connection arguments (no GUI controls yet for port, identity file, or arbitrary SSH options), a basic key map, no scrollback or alternate-screen buffer or full VT compatibility, and no end-to-end authentication/server test in this session. The incremental parser handles common CSI cursor/erase controls, OSC title sequences, and ANSI SGR colors (16-color, 256-color, and 24-bit RGB); unsupported terminal modes and control sequences remain outside the current implementation. Unicode input is UTF-8 encoded, and East Asian wide characters occupy two cells, but rendering still does not correctly handle surrogate pairs or combining marks. Use the standard OpenSSH host-key and authentication prompts; host-key checking is not disabled.
 
@@ -25,7 +25,14 @@ From the repository root in PowerShell:
 go test ./...
 go vet ./...
 go build ./...
-go build -o .\\terminal.exe .\\cmd\\terminal
+go build -ldflags "-H=windowsgui" -o .\\terminal.exe .\\cmd\\terminal
+```
+
+The `-H=windowsgui` flag is required: without it the linker produces a console-subsystem executable, which opens an extra console window. The app icon (`terminal.ico`) is compiled into `cmd/terminal/rsrc_windows_amd64.syso`, which is kept in the source tree so regular builds need no resource tool. Regenerate it only after changing the icon, with LLVM-MinGW or any Win32 `windres`:
+
+```powershell
+cd .\\cmd\\terminal
+windres -O coff --target=pe-x86-64 -i terminal.rc -o rsrc_windows_amd64.syso
 ```
 
 Run `.\\terminal.exe`, enter `user@host` or `host`, and select **Connect**. OpenSSH handles authentication and host-key verification. Select **PowerShell** to open a local PowerShell 7 session instead. Select **Disconnect** to close the current session. `terminal.exe` is a local build artifact and should not be committed.
@@ -40,7 +47,7 @@ Run `.\\terminal.exe`, enter `user@host` or `host`, and select **Connect**. Open
 
 ## Project layout
 
-- `cmd/terminal`: Win32 GUI entry point and GUI/session integration
+- `cmd/terminal`: Win32 GUI entry point, GUI/session integration, and the app icon/window resource (`terminal.png`, `terminal.ico`, `terminal.rc`, `rsrc_windows_amd64.syso`)
 - `internal/winapi`: dynamically loaded Win32 and ConPTY procedures
 - `internal/term`: terminal screen buffer and incremental VT parser
 - `internal/sshclient`: executable discovery (OpenSSH and PowerShell), Windows argument quoting, and ConPTY process/session lifecycle
