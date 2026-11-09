@@ -69,6 +69,9 @@ const (
 	cellWidth     = 10
 	cellHeight    = 20
 	toolbarHeight = 48
+	terminalBG    = 0x001E1E1E // COLORREF for the terminal background.
+	cursorBorder  = 0x00A0A0A0 // COLORREF for the cursor outline.
+	srcCopy       = 0x00CC0020
 	selectionBG   = 0x01A56E2B // Tagged RGB: #A56E2B.
 	selectionFG   = 0x01FFFFFF // Tagged RGB: #FFFFFF.
 )
@@ -134,6 +137,11 @@ var (
 	terminalFont                                                uintptr
 	cjkFont                                                     uintptr
 	toolbarBrush                                                uintptr
+	backDC                                                      uintptr
+	backBitmap                                                  uintptr
+	backStockBitmap                                             uintptr
+	backW, backH                                                int32
+	brushCache                                                  = make(map[uint32]uintptr)
 )
 
 func initTelemetry() {
@@ -384,6 +392,22 @@ func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 		if toolbarBrush != 0 {
 			winapi.DeleteObject.Call(toolbarBrush)
 			toolbarBrush = 0
+		}
+		if backDC != 0 {
+			if backStockBitmap != 0 {
+				winapi.SelectObject.Call(backDC, backStockBitmap)
+				backStockBitmap = 0
+			}
+			if backBitmap != 0 {
+				winapi.DeleteObject.Call(backBitmap)
+				backBitmap = 0
+			}
+			winapi.DeleteDC.Call(backDC)
+			backDC = 0
+		}
+		for color, brush := range brushCache {
+			winapi.DeleteObject.Call(brush)
+			delete(brushCache, color)
 		}
 		winapi.PostQuitMessage.Call(0)
 		return 0
@@ -848,17 +872,100 @@ func resizeTerminal(hwnd uintptr) {
 	sessionMu.Unlock()
 }
 
+// ensureBackBuffer returns a memory DC with a bitmap matching the window client
+// area. fresh reports that the bitmap was (re)created, so the caller must render
+// the whole terminal area rather than only the invalid rect.
+func ensureBackBuffer(windowDC uintptr, width, height int32) (uintptr, bool) {
+	if width <= 0 || height <= 0 {
+		return 0, false
+	}
+	if backDC == 0 {
+		dc, _, _ := winapi.CreateCompatibleDC.Call(windowDC)
+		if dc == 0 {
+			return 0, false
+		}
+		backDC = dc
+	}
+	fresh := false
+	if backBitmap == 0 || backW != width || backH != height {
+		bitmap, _, _ := winapi.CreateCompatibleBitmap.Call(windowDC, uintptr(width), uintptr(height))
+		if bitmap == 0 {
+			return 0, false
+		}
+		stock, _, _ := winapi.SelectObject.Call(backDC, bitmap)
+		if backBitmap != 0 {
+			winapi.DeleteObject.Call(backBitmap)
+		} else {
+			backStockBitmap = stock
+		}
+		backBitmap = bitmap
+		backW, backH = width, height
+		fresh = true
+	}
+	return backDC, fresh
+}
+
+// brushRef returns a cached solid brush for a GDI COLORREF so streaming
+// repaints do not create and destroy hundreds of brushes per frame.
+func brushRef(color uint32) uintptr {
+	if brush, ok := brushCache[color]; ok {
+		return brush
+	}
+	brush, _, _ := winapi.CreateSolidBrush.Call(uintptr(color))
+	if brush == 0 {
+		return 0
+	}
+	if len(brushCache) >= 1024 {
+		for key, cached := range brushCache {
+			winapi.DeleteObject.Call(cached)
+			delete(brushCache, key)
+		}
+	}
+	brushCache[color] = brush
+	return brush
+}
+
 func paint(hwnd uintptr) {
 	paintStarted := time.Now()
 	var runs, cells int
 	var ps paintStruct
-	hdc, _, _ := winapi.BeginPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
+	windowDC, _, _ := winapi.BeginPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
+	if windowDC == 0 {
+		return
+	}
 	var rc rect
 	winapi.GetClientRect.Call(hwnd, uintptr(unsafe.Pointer(&rc)))
-	brush, _, _ := winapi.CreateSolidBrush.Call(0x001E1E1E)
+	hdc, fresh := ensureBackBuffer(windowDC, rc.Right, rc.Bottom)
+	if hdc == 0 {
+		winapi.EndPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
+		return
+	}
+	clip := ps.Paint
+	if clip.Left < 0 {
+		clip.Left = 0
+	}
+	if clip.Top < toolbarHeight {
+		clip.Top = toolbarHeight
+	}
+	if clip.Right > rc.Right {
+		clip.Right = rc.Right
+	}
+	if clip.Bottom > rc.Bottom {
+		clip.Bottom = rc.Bottom
+	}
+	if fresh {
+		clip = rect{Left: 0, Top: toolbarHeight, Right: rc.Right, Bottom: rc.Bottom}
+	}
+	if clip.Right <= clip.Left || clip.Bottom <= clip.Top {
+		winapi.EndPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
+		return
+	}
+	// Render off-screen and blit once: the window must never show a frame that
+	// has only been cleared while streamed output is loading.
+	winapi.IntersectClipRect.Call(hdc, uintptr(clip.Left), uintptr(clip.Top), uintptr(clip.Right), uintptr(clip.Bottom))
+	brush := brushRef(terminalBG)
 	termRect := rect{Left: 0, Top: toolbarHeight, Right: rc.Right, Bottom: rc.Bottom}
 	winapi.FillRect.Call(hdc, uintptr(unsafe.Pointer(&termRect)), brush)
-	winapi.DeleteObject.Call(brush)
 	winapi.SetBkMode.Call(hdc, 1)
 	var previousFont uintptr
 	if terminalFont != 0 {
@@ -886,9 +993,8 @@ func paint(hwnd uintptr) {
 			left := int32(12 + x*cellWidth)
 			top := int32(toolbarHeight + 6 + y*cellHeight)
 			background := rect{Left: left, Top: top, Right: left + int32((end-x)*cellWidth), Bottom: top + cellHeight}
-			cellBrush, _, _ := winapi.CreateSolidBrush.Call(uintptr(colorRef(cell.BG)))
+			cellBrush := brushRef(colorRef(cell.BG))
 			winapi.FillRect.Call(hdc, uintptr(unsafe.Pointer(&background)), cellBrush)
-			winapi.DeleteObject.Call(cellBrush)
 			runs++
 			cells += end - x
 			line := make([]uint16, 0, end-x)
@@ -933,14 +1039,15 @@ func paint(hwnd uintptr) {
 		cLeft := int32(12 + curX*cellWidth)
 		cTop := int32(toolbarHeight + 6 + curY*cellHeight)
 		cursorRc := rect{Left: cLeft, Top: cTop, Right: cLeft + cellWidth, Bottom: cTop + cellHeight}
-		cursorBrush, _, _ := winapi.CreateSolidBrush.Call(0x00A0A0A0)
+		cursorBrush := brushRef(cursorBorder)
 		winapi.FrameRect.Call(hdc, uintptr(unsafe.Pointer(&cursorRc)), cursorBrush)
-		winapi.DeleteObject.Call(cursorBrush)
 		lastCursorRc = cursorRc
 	}
 	if previousFont != 0 {
 		winapi.SelectObject.Call(hdc, previousFont)
 	}
+	winapi.SelectClipRgn.Call(hdc, 0)
+	winapi.BitBlt.Call(windowDC, uintptr(clip.Left), uintptr(clip.Top), uintptr(clip.Right-clip.Left), uintptr(clip.Bottom-clip.Top), hdc, uintptr(clip.Left), uintptr(clip.Top), srcCopy)
 	winapi.EndPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
 	elapsed := time.Since(paintStarted)
 	paintFrames++
