@@ -59,8 +59,9 @@ type securityAttributes struct {
 	_2                 uint32
 }
 
-// Session owns one ssh.exe process and its ConPTY transport. Output must be
-// drained concurrently with input writes to avoid filling the synchronous pipe.
+// Session owns one supported child process and its ConPTY transport. Output
+// must be drained concurrently with input writes to avoid filling the
+// synchronous pipe.
 type Session struct {
 	console uintptr
 	process syscall.Handle
@@ -69,23 +70,34 @@ type Session struct {
 	Output  *os.File
 }
 
-// Start creates a ConPTY session and starts only the supplied executable.
-// executable should normally come from ResolveExecutable; args are passed
-// directly through Windows command-line quoting and never through a shell.
+// allowedExecutable reports whether path names a child process this terminal
+// may run. Arguments are passed directly and never interpreted by a shell.
+func allowedExecutable(path string) bool {
+	switch strings.ToLower(filepath.Base(path)) {
+	case "ssh.exe", "pwsh.exe":
+		return true
+	}
+	return false
+}
+
+// Start creates a ConPTY session and starts one of the supported executables.
+// executable should normally come from ResolveExecutable or ResolvePowerShell;
+// args are passed directly through Windows command-line quoting and never
+// through a shell.
 func Start(executable string, args []string, columns, rows int) (*Session, error) {
-	if !strings.EqualFold(filepath.Base(executable), "ssh.exe") {
-		return nil, fmt.Errorf("refusing to launch %q: the only permitted session executable is ssh.exe", executable)
+	if !allowedExecutable(executable) {
+		return nil, fmt.Errorf("refusing to launch %q: supported executables are ssh.exe and pwsh.exe", executable)
 	}
 	if columns < 1 || rows < 1 || columns > 32767 || rows > 32767 {
 		return nil, fmt.Errorf("invalid terminal size %dx%d", columns, rows)
 	}
 	exe16, err := syscall.UTF16PtrFromString(executable)
 	if err != nil {
-		return nil, fmt.Errorf("encode ssh executable path: %w", err)
+		return nil, fmt.Errorf("encode executable path: %w", err)
 	}
 	cmd16, err := syscall.UTF16FromString(CommandLine(executable, args))
 	if err != nil {
-		return nil, fmt.Errorf("encode ssh command line: %w", err)
+		return nil, fmt.Errorf("encode command line: %w", err)
 	}
 
 	var inputRead, inputWrite, outputRead, outputWrite syscall.Handle
@@ -149,7 +161,7 @@ func Start(executable string, args []string, columns, rows int) (*Session, error
 	runtime.KeepAlive(cmd16)
 	runtime.KeepAlive(exe16)
 	if ok == 0 {
-		return nil, fmt.Errorf("CreateProcessW for ssh.exe failed: %w", callError(callErr))
+		return nil, fmt.Errorf("CreateProcessW for %s failed: %w", filepath.Base(executable), callError(callErr))
 	}
 	// The process has duplicated the pseudoconsole's channel handles.
 	closeHandle(&inputRead)
@@ -202,7 +214,7 @@ func callError(err error) error {
 // Resize updates the pseudoconsole dimensions in character cells.
 func (s *Session) Resize(columns, rows int) error {
 	if s == nil || s.console == 0 {
-		return fmt.Errorf("SSH session is closed")
+		return fmt.Errorf("session is closed")
 	}
 	if columns < 1 || rows < 1 || columns > 32767 || rows > 32767 {
 		return fmt.Errorf("invalid terminal size %dx%d", columns, rows)
@@ -214,14 +226,14 @@ func (s *Session) Resize(columns, rows int) error {
 	return nil
 }
 
-// Wait blocks until ssh.exe exits and returns its process exit code.
+// Wait blocks until the child process exits and returns its exit code.
 func (s *Session) Wait() (uint32, error) {
 	if s == nil || s.process == 0 {
-		return 0, fmt.Errorf("SSH session is closed")
+		return 0, fmt.Errorf("session is closed")
 	}
 	r, _, callErr := winapi.WaitForSingleObject.Call(uintptr(s.process), infinite)
 	if uint32(r) == waitFailed {
-		return 0, fmt.Errorf("wait for ssh.exe: %w", callError(callErr))
+		return 0, fmt.Errorf("wait for child process: %w", callError(callErr))
 	}
 	if uint32(r) != waitObject0 {
 		return 0, fmt.Errorf("unexpected wait result 0x%X", uint32(r))
@@ -234,7 +246,7 @@ func (s *Session) Wait() (uint32, error) {
 	return code, nil
 }
 
-// Close shuts down the ConPTY session and waits briefly for ssh.exe to exit.
+// Close shuts down the ConPTY session and waits briefly for the child to exit.
 // Callers should stop writing and keep the output reader active during shutdown.
 func (s *Session) Close() error {
 	if s == nil {
@@ -256,11 +268,11 @@ func (s *Session) Close() error {
 		if uint32(r) == waitTimeout {
 			ok, _, termErr := winapi.TerminateProcess.Call(uintptr(s.process), 1)
 			if ok == 0 && first == nil {
-				first = fmt.Errorf("terminate ssh.exe: %w", callError(termErr))
+				first = fmt.Errorf("terminate child process: %w", callError(termErr))
 			}
 			winapi.WaitForSingleObject.Call(uintptr(s.process), infinite)
 		} else if uint32(r) == waitFailed && first == nil {
-			first = fmt.Errorf("wait for ssh.exe shutdown: %w", callError(callErr))
+			first = fmt.Errorf("wait for child process shutdown: %w", callError(callErr))
 		}
 	}
 	if s.Output != nil {

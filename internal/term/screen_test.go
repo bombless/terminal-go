@@ -77,3 +77,62 @@ func TestScreenMoveClampsCoordinates(t *testing.T) {
 		t.Fatalf("cursor = (%d,%d), want (4,0)", s.X, s.Y)
 	}
 }
+
+func TestScreenWideRuneOccupiesTwoCells(t *testing.T) {
+	s := NewScreen(8, 2)
+	for _, r := range "目录:" {
+		s.Put(r)
+	}
+	if s.X != 5 {
+		t.Fatalf("cursor X = %d, want 5", s.X)
+	}
+	cells := s.Cells[0][:5]
+	if cells[0].Rune != '目' || cells[1].Rune != 0 || cells[2].Rune != '录' || cells[3].Rune != 0 || cells[4].Rune != ':' {
+		t.Fatalf("wide cells = %+v", cells)
+	}
+}
+
+func TestScreenWideRuneWrapsWhenNoRoom(t *testing.T) {
+	s := NewScreen(4, 2)
+	for _, r := range "abc目" {
+		s.Put(r)
+	}
+	if s.X != 2 || s.Y != 1 {
+		t.Fatalf("cursor = (%d,%d), want (2,1)", s.X, s.Y)
+	}
+	if s.Cells[1][0].Rune != '目' || s.Cells[1][1].Rune != 0 {
+		t.Fatalf("wrapped wide cells = %+v", s.Cells[1][:2])
+	}
+}
+
+func TestScreenOverwriteClearsWideHalf(t *testing.T) {
+	s := NewScreen(4, 2)
+	s.Put('目')
+	s.Move(1, 0)
+	s.Put('X')
+	if s.Cells[0][0].Rune != ' ' || s.Cells[0][1].Rune != 'X' {
+		t.Fatalf("cells = %+v, want space then X", s.Cells[0][:2])
+	}
+}
+
+func TestScreenEraseClearsWideHalves(t *testing.T) {
+	s := NewScreen(8, 1)
+	for _, r := range "目录x" {
+		s.Put(r)
+	}
+	s.Move(1, 0) // second half of 目
+	s.eraseLineFromCursor()
+	if s.Cells[0][0].Rune != ' ' || s.Cells[0][1].Rune != ' ' {
+		t.Fatalf("erase from continuation left %+v", s.Cells[0][:2])
+	}
+
+	s = NewScreen(8, 1)
+	for _, r := range "目录x" {
+		s.Put(r)
+	}
+	s.Move(0, 0)
+	s.eraseLineToCursor() // erases only the first half of 目
+	if s.Cells[0][0].Rune != ' ' || s.Cells[0][1].Rune != ' ' {
+		t.Fatalf("erase to wide first half left %+v", s.Cells[0][:2])
+	}
+}

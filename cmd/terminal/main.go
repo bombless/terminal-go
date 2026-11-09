@@ -60,6 +60,7 @@ const (
 	idConnect        = 1002
 	idDisconnect     = 1003
 	idStatus         = 1004
+	idPowerShell     = 1005
 	timerIDHeartbeat = 1
 	timerIDCursor    = 2
 	enChange         = 0x0300
@@ -109,28 +110,30 @@ type textSelection struct {
 }
 
 var (
-	className                                              = syscall.StringToUTF16Ptr("TerminalGoWindow")
-	windowTitle                                            = syscall.StringToUTF16Ptr("terminal-go - SSH Terminal")
-	mainHwnd                                               uintptr
-	hostEdit, connectButton, disconnectButton, statusLabel uintptr
-	screenMu                                               sync.Mutex
-	screen                                                 = term.NewScreen(96, 30)
-	parser                                                 = term.NewParser(screen)
-	sessionMu                                              sync.Mutex
-	inputWriteMu                                           sync.Mutex
-	session                                                *sshclient.Session
-	inputQueue                                             = make(chan pendingInput, 256)
-	selection                                              textSelection
-	cursorBlinkOn                                                 = true
-	cursorBlinkInterval                                    uint32 = 530
-	lastCursorRc                                           rect
-	telemetry                                              *log.Logger
-	telemetryFile                                          *os.File
-	paintFrames                                            uint64
-	lastSlowPaint                                          time.Time
-	lastHeartbeat                                          time.Time
-	terminalFont                                           uintptr
-	toolbarBrush                                           uintptr
+	className                                                   = syscall.StringToUTF16Ptr("TerminalGoWindow")
+	windowTitle                                                 = syscall.StringToUTF16Ptr("terminal-go - SSH / PowerShell Terminal")
+	mainHwnd                                                    uintptr
+	hostEdit, connectButton, disconnectButton, powerShellButton uintptr
+	statusLabel                                                 uintptr
+	screenMu                                                    sync.Mutex
+	screen                                                      = term.NewScreen(96, 30)
+	parser                                                      = term.NewParser(screen)
+	sessionMu                                                   sync.Mutex
+	inputWriteMu                                                sync.Mutex
+	session                                                     *sshclient.Session
+	inputQueue                                                  = make(chan pendingInput, 256)
+	selection                                                   textSelection
+	cursorBlinkOn                                                      = true
+	cursorBlinkInterval                                         uint32 = 530
+	lastCursorRc                                                rect
+	telemetry                                                   *log.Logger
+	telemetryFile                                               *os.File
+	paintFrames                                                 uint64
+	lastSlowPaint                                               time.Time
+	lastHeartbeat                                               time.Time
+	terminalFont                                                uintptr
+	cjkFont                                                     uintptr
+	toolbarBrush                                                uintptr
 )
 
 func initTelemetry() {
@@ -207,6 +210,8 @@ func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 		telemetryf("window_message wm_create_begin")
 		fontName := syscall.StringToUTF16Ptr("Consolas")
 		terminalFont, _, _ = winapi.CreateFontW.Call(^uintptr(15), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0x31, uintptr(unsafe.Pointer(fontName)))
+		cjkFontName := syscall.StringToUTF16Ptr("Microsoft YaHei")
+		cjkFont, _, _ = winapi.CreateFontW.Call(^uintptr(15), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, uintptr(unsafe.Pointer(cjkFontName)))
 		toolbarBrush, _, _ = winapi.CreateSolidBrush.Call(0x001E1E1E)
 		createToolbar(hwnd)
 		winapi.User32.NewProc("SetTimer").Call(hwnd, timerIDHeartbeat, 1000, 0)
@@ -217,7 +222,7 @@ func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 		cursorBlinkInterval = uint32(blinkTime)
 		winapi.User32.NewProc("SetTimer").Call(hwnd, timerIDCursor, uintptr(cursorBlinkInterval), 0)
 		lastHeartbeat = time.Now()
-		telemetryf("window_message wm_create_end host=%d connect=%d disconnect=%d status=%d", hostEdit, connectButton, disconnectButton, statusLabel)
+		telemetryf("window_message wm_create_end host=%d connect=%d disconnect=%d powershell=%d status=%d", hostEdit, connectButton, disconnectButton, powerShellButton, statusLabel)
 		return 0
 	case wmSetFocus:
 		resetCursorBlink(hwnd)
@@ -278,9 +283,14 @@ func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 				connectSSH(hwnd)
 				return 0
 			}
+		case idPowerShell:
+			if notifyCode == 0 { // BN_CLICKED
+				startPowerShell(hwnd)
+				return 0
+			}
 		case idDisconnect:
 			if notifyCode == 0 { // BN_CLICKED
-				disconnectSSH("Disconnected")
+				disconnectSession("Disconnected")
 				return 0
 			}
 		}
@@ -360,12 +370,16 @@ func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 		}
 		return 0
 	case wmDestroy:
-		disconnectSSH("Window closed")
+		disconnectSession("Window closed")
 		winapi.User32.NewProc("KillTimer").Call(hwnd, timerIDHeartbeat)
 		winapi.User32.NewProc("KillTimer").Call(hwnd, timerIDCursor)
 		if terminalFont != 0 {
 			winapi.DeleteObject.Call(terminalFont)
 			terminalFont = 0
+		}
+		if cjkFont != 0 {
+			winapi.DeleteObject.Call(cjkFont)
+			cjkFont = 0
 		}
 		if toolbarBrush != 0 {
 			winapi.DeleteObject.Call(toolbarBrush)
@@ -408,6 +422,12 @@ func selectedText() string {
 		}
 		r := screen.Cells[y][x].Rune
 		if r == 0 {
+			if x > 0 && term.RuneWidth(screen.Cells[y][x-1].Rune) == 2 {
+				if x == screen.Width-1 && pos < last {
+					out.WriteByte('\n')
+				}
+				continue // second half of a wide glyph
+			}
 			r = ' '
 		}
 		out.WriteRune(r)
@@ -534,11 +554,13 @@ func createToolbar(hwnd uintptr) {
 	hostText := syscall.StringToUTF16Ptr("")
 	connectText := syscall.StringToUTF16Ptr("Connect")
 	disconnectText := syscall.StringToUTF16Ptr("Disconnect")
+	powerShellText := syscall.StringToUTF16Ptr("PowerShell")
 	statusText := syscall.StringToUTF16Ptr("Not connected")
 	hostEdit, _, _ = create.Call(0, uintptr(unsafe.Pointer(hostClass)), uintptr(unsafe.Pointer(hostText)), wsChild|wsVisible|wsBorder|wsTabStop|esAutoHScroll, 12, 10, 300, 26, hwnd, idHost, 0, 0)
 	connectButton, _, _ = create.Call(0, uintptr(unsafe.Pointer(buttonClass)), uintptr(unsafe.Pointer(connectText)), wsChild|wsVisible|wsTabStop|bsPushButton, 322, 10, 88, 26, hwnd, idConnect, 0, 0)
 	disconnectButton, _, _ = create.Call(0, uintptr(unsafe.Pointer(buttonClass)), uintptr(unsafe.Pointer(disconnectText)), wsChild|wsVisible|wsTabStop|bsPushButton, 418, 10, 96, 26, hwnd, idDisconnect, 0, 0)
-	statusLabel, _, _ = create.Call(0, uintptr(unsafe.Pointer(staticClass)), uintptr(unsafe.Pointer(statusText)), wsChild|wsVisible|ssLeft, 526, 14, 430, 22, hwnd, idStatus, 0, 0)
+	powerShellButton, _, _ = create.Call(0, uintptr(unsafe.Pointer(buttonClass)), uintptr(unsafe.Pointer(powerShellText)), wsChild|wsVisible|wsTabStop|bsPushButton, 522, 10, 96, 26, hwnd, idPowerShell, 0, 0)
+	statusLabel, _, _ = create.Call(0, uintptr(unsafe.Pointer(staticClass)), uintptr(unsafe.Pointer(statusText)), wsChild|wsVisible|ssLeft, 626, 14, 330, 22, hwnd, idStatus, 0, 0)
 }
 
 func layoutToolbar(hwnd uintptr, width, height int32) {
@@ -546,14 +568,15 @@ func layoutToolbar(hwnd uintptr, width, height int32) {
 		return
 	}
 	move := winapi.User32.NewProc("MoveWindow")
-	statusWidth := width - 538
+	statusWidth := width - 638
 	if statusWidth < 80 {
 		statusWidth = 80
 	}
 	move.Call(hostEdit, 12, 10, 300, 26, 1)
 	move.Call(connectButton, 322, 10, 88, 26, 1)
 	move.Call(disconnectButton, 418, 10, 96, 26, 1)
-	move.Call(statusLabel, 526, 14, uintptr(statusWidth), 22, 1)
+	move.Call(powerShellButton, 522, 10, 96, 26, 1)
+	move.Call(statusLabel, 626, 14, uintptr(statusWidth), 22, 1)
 	_ = hwnd
 	_ = height
 }
@@ -569,16 +592,17 @@ func setStatus(value string) {
 	}
 }
 
-func connectSSH(hwnd uintptr) {
-	connectStarted := time.Now()
-	telemetryf("connect_start")
+func hasSession() bool {
 	sessionMu.Lock()
-	if session != nil {
-		sessionMu.Unlock()
+	defer sessionMu.Unlock()
+	return session != nil
+}
+
+func connectSSH(hwnd uintptr) {
+	if hasSession() {
 		setStatus("Already connected")
 		return
 	}
-	sessionMu.Unlock()
 	length, _, _ := winapi.User32.NewProc("GetWindowTextLengthW").Call(hostEdit)
 	buffer := make([]uint16, int(length)+1)
 	winapi.User32.NewProc("GetWindowTextW").Call(hostEdit, uintptr(unsafe.Pointer(&buffer[0])), uintptr(len(buffer)))
@@ -587,16 +611,13 @@ func connectSSH(hwnd uintptr) {
 		setStatus("Enter user@host or host")
 		return
 	}
-	setStatus("Connecting to " + host + "...")
 	resolveStarted := time.Now()
 	executable, err := sshclient.ResolveExecutable("")
 	telemetryf("ssh_resolve duration=%s err=%v", time.Since(resolveStarted), err)
 	if err != nil {
-		telemetryf("connect_failed stage=resolve total=%s", time.Since(connectStarted))
 		setStatus("SSH unavailable: " + err.Error())
 		return
 	}
-	spawnStarted := time.Now()
 	var sshArgs []string
 	cleanHost := host
 	if lastColon := strings.LastIndex(host, ":"); lastColon != -1 && !strings.Contains(host[lastColon:], "]") {
@@ -607,28 +628,50 @@ func connectSSH(hwnd uintptr) {
 		}
 	}
 	sshArgs = append(sshArgs, cleanHost)
+	startSession(hwnd, "SSH", "Connecting to "+host+"...", "Connected: "+host, executable, sshArgs)
+}
 
-	s, err := sshclient.Start(executable, sshArgs, screen.Width, screen.Height)
-	telemetryf("ssh_spawn duration=%s err=%v total=%s", time.Since(spawnStarted), err, time.Since(connectStarted))
+func startPowerShell(hwnd uintptr) {
+	if hasSession() {
+		setStatus("Already connected")
+		return
+	}
+	executable, err := sshclient.ResolvePowerShell("")
 	if err != nil {
-		setStatus("Connect failed: " + err.Error())
+		setStatus("PowerShell unavailable: " + err.Error())
+		return
+	}
+	startSession(hwnd, "PowerShell", "Starting PowerShell...", "Connected: PowerShell", executable, nil)
+}
+
+// startSession launches one supported child process in ConPTY and installs it
+// as the active session unless another connect already won the race.
+func startSession(hwnd uintptr, label, pendingStatus, connectedStatus, executable string, args []string) {
+	started := time.Now()
+	telemetryf("session_start label=%s executable=%s", label, filepath.Base(executable))
+	setStatus(pendingStatus)
+	spawnStarted := time.Now()
+	s, err := sshclient.Start(executable, args, screen.Width, screen.Height)
+	telemetryf("session_spawn label=%s duration=%s err=%v total=%s", label, time.Since(spawnStarted), err, time.Since(started))
+	if err != nil {
+		setStatus(label + " start failed: " + err.Error())
 		return
 	}
 	sessionMu.Lock()
 	if session != nil {
 		sessionMu.Unlock()
-		s.Close()
+		_ = s.Close()
 		return
 	}
 	session = s
 	sessionMu.Unlock()
-	setStatus("Connected: " + host)
+	setStatus(connectedStatus)
 	winapi.User32.NewProc("SetFocus").Call(hwnd)
 	resetCursorBlink(hwnd)
-	go readSessionOutput(s, hwnd)
+	go readSessionOutput(s, hwnd, label)
 }
 
-func readSessionOutput(s *sshclient.Session, hwnd uintptr) {
+func readSessionOutput(s *sshclient.Session, hwnd uintptr, label string) {
 	buf := make([]byte, 8192)
 	windowStart := time.Now()
 	var windowBytes, windowChunks int64
@@ -657,7 +700,7 @@ func readSessionOutput(s *sshclient.Session, hwnd uintptr) {
 			}
 		}
 		if err != nil {
-			telemetryf("output_reader_end err=%v pending_bytes=%d pending_chunks=%d", err, windowBytes, windowChunks)
+			telemetryf("output_reader_end label=%s err=%v pending_bytes=%d pending_chunks=%d", label, err, windowBytes, windowChunks)
 			break
 		}
 	}
@@ -675,11 +718,11 @@ func readSessionOutput(s *sshclient.Session, hwnd uintptr) {
 	_ = s.Close()
 	inputWriteMu.Unlock()
 	if waitErr != nil {
-		telemetryf("ssh_exit wait_error=%v", waitErr)
-		setStatus("SSH ended: " + waitErr.Error())
+		telemetryf("session_exit label=%s wait_error=%v", label, waitErr)
+		setStatus(label + " ended: " + waitErr.Error())
 	} else {
-		telemetryf("ssh_exit code=%d", code)
-		setStatus(fmt.Sprintf("SSH exited (%d)", code))
+		telemetryf("session_exit label=%s code=%d", label, code)
+		setStatus(fmt.Sprintf("%s exited (%d)", label, code))
 	}
 	winapi.User32.NewProc("InvalidateRect").Call(hwnd, 0, 0)
 }
@@ -696,7 +739,7 @@ func writeInput(data []byte) {
 	case inputQueue <- item:
 	default:
 		telemetryf("input_queue_full queued=%d capacity=%d dropped_bytes=%d", len(inputQueue), cap(inputQueue), len(data))
-		setStatus("SSH input queue full")
+		setStatus("Session input queue full")
 	}
 }
 
@@ -720,11 +763,11 @@ func inputWriter() {
 		for len(data) > 0 {
 			n, err := input.Write(data)
 			if err != nil {
-				setStatus("SSH input failed: " + err.Error())
+				setStatus("Session input failed: " + err.Error())
 				break
 			}
 			if n == 0 {
-				setStatus("SSH input pipe closed")
+				setStatus("Session input pipe closed")
 				break
 			}
 			data = data[n:]
@@ -737,7 +780,7 @@ func inputWriter() {
 	}
 }
 
-func disconnectSSH(status string) {
+func disconnectSession(status string) {
 	sessionMu.Lock()
 	s := session
 	session = nil
@@ -848,26 +891,24 @@ func paint(hwnd uintptr) {
 			winapi.DeleteObject.Call(cellBrush)
 			runs++
 			cells += end - x
-			line := make([]uint16, end-x)
+			line := make([]uint16, 0, end-x)
+			dx := make([]int32, 0, end-x)
 			for i := x; i < end; i++ {
 				r := screen.Cells[y][i].Rune
 				if r == 0 {
+					if i > 0 && term.RuneWidth(screen.Cells[y][i-1].Rune) == 2 {
+						continue // continuation cell of the preceding wide glyph
+					}
 					r = ' '
 				}
 				if r > 0xFFFF {
 					r = '?'
 				}
-				line[i-x] = uint16(r)
+				line = append(line, uint16(r))
+				dx = append(dx, int32(cellWidth*term.RuneWidth(r)))
 			}
 			winapi.SetTextColor.Call(hdc, uintptr(colorRef(cell.FG)))
-			// Explicit advances keep every glyph on the fixed terminal-cell grid.
-			dx := make([]int32, len(line))
-			for i := range dx {
-				dx[i] = cellWidth
-			}
-			winapi.ExtTextOutW.Call(hdc, uintptr(left), uintptr(top), 0x0004,
-				uintptr(unsafe.Pointer(&background)), uintptr(unsafe.Pointer(&line[0])),
-				uintptr(len(line)), uintptr(unsafe.Pointer(&dx[0])))
+			drawGlyphRuns(hdc, left, top, &background, line, dx)
 			x = end
 		}
 	}
@@ -908,6 +949,39 @@ func paint(hwnd uintptr) {
 		lastSlowPaint = time.Now()
 	} else if paintFrames%100 == 0 {
 		telemetryf("paint_sample duration=%s cells=%d text_runs=%d frame=%d", elapsed, cells, runs, paintFrames)
+	}
+}
+
+// drawGlyphRuns emits one ExtTextOutW per contiguous script run so East Asian
+// glyphs use a font that contains them. The fixed per-cell dx array keeps every
+// glyph on the terminal grid regardless of the font's natural advances.
+func drawGlyphRuns(hdc uintptr, left, top int32, clip *rect, line []uint16, dx []int32) {
+	for start := 0; start < len(line); {
+		font := terminalFont
+		if term.RuneWidth(rune(line[start])) == 2 && cjkFont != 0 {
+			font = cjkFont
+		}
+		end := start + 1
+		for end < len(line) {
+			next := terminalFont
+			if term.RuneWidth(rune(line[end])) == 2 && cjkFont != 0 {
+				next = cjkFont
+			}
+			if next != font {
+				break
+			}
+			end++
+		}
+		if font != 0 {
+			winapi.SelectObject.Call(hdc, font)
+		}
+		winapi.ExtTextOutW.Call(hdc, uintptr(left), uintptr(top), 0x0004,
+			uintptr(unsafe.Pointer(clip)), uintptr(unsafe.Pointer(&line[start])),
+			uintptr(end-start), uintptr(unsafe.Pointer(&dx[start])))
+		for i := start; i < end; i++ {
+			left += dx[i]
+		}
+		start = end
 	}
 }
 

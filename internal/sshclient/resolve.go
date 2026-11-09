@@ -1,4 +1,5 @@
-// Package sshclient locates the Windows OpenSSH executable without a shell.
+// Package sshclient locates and runs the supported Windows terminal executables
+// without a shell.
 package sshclient
 
 import (
@@ -27,13 +28,32 @@ func ResolveExecutable(override string) (string, error) {
 	return filepath.Abs(path)
 }
 
+// ResolvePowerShell returns an absolute path to pwsh.exe. An explicit override
+// takes precedence, followed by the standard PowerShell 7 install location and PATH.
+func ResolvePowerShell(override string) (string, error) {
+	if override != "" {
+		return executableFile(override)
+	}
+	if programFiles := os.Getenv("ProgramFiles"); programFiles != "" {
+		candidate := filepath.Join(programFiles, "PowerShell", "7", "pwsh.exe")
+		if path, err := executableFile(candidate); err == nil {
+			return path, nil
+		}
+	}
+	path, err := exec.LookPath("pwsh.exe")
+	if err != nil {
+		return "", fmt.Errorf("PowerShell 7 (pwsh.exe) was not found; install PowerShell 7 or add pwsh.exe to PATH: %w", err)
+	}
+	return filepath.Abs(path)
+}
+
 func executableFile(path string) (string, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return "", err
 	}
 	if info.IsDir() {
-		return "", fmt.Errorf("ssh executable path is a directory: %s", path)
+		return "", fmt.Errorf("executable path is a directory: %s", path)
 	}
 	return filepath.Abs(path)
 }

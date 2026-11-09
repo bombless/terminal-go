@@ -60,7 +60,11 @@ func (s *Screen) Put(r rune) {
 	if r < 32 {
 		return
 	}
-	if s.X >= s.Width {
+	width := RuneWidth(r)
+	if width > s.Width {
+		width = 1
+	}
+	if s.X+width > s.Width {
 		s.X = 0
 		s.Y++
 		if s.Y >= s.Height {
@@ -68,8 +72,15 @@ func (s *Screen) Put(r rune) {
 			s.Y = s.Height - 1
 		}
 	}
+	s.clearWideAt(s.Y, s.X)
+	if width == 2 {
+		s.clearWideAt(s.Y, s.X+1)
+	}
 	s.Cells[s.Y][s.X] = Cell{Rune: r, FG: s.FG, BG: s.BG}
-	s.X++
+	if width == 2 {
+		s.Cells[s.Y][s.X+1] = Cell{Rune: 0, FG: s.FG, BG: s.BG}
+	}
+	s.X += width
 }
 func (s *Screen) Clear() { s.eraseDisplay(); s.X, s.Y = 0, 0 }
 func (s *Screen) Move(x, y int) {
@@ -86,6 +97,20 @@ func (s *Screen) Move(x, y int) {
 		y = s.Height - 1
 	}
 	s.X, s.Y = x, y
+}
+
+// clearWideAt removes any half of a wide glyph covering (x,y) so overwriting
+// one cell cannot leave a dangling half behind.
+func (s *Screen) clearWideAt(y, x int) {
+	if x < 0 || x >= s.Width {
+		return
+	}
+	if s.Cells[y][x].Rune == 0 && x > 0 && RuneWidth(s.Cells[y][x-1].Rune) == 2 {
+		s.Cells[y][x-1] = s.blankCell()
+	}
+	if RuneWidth(s.Cells[y][x].Rune) == 2 && x+1 < s.Width {
+		s.Cells[y][x+1] = s.blankCell()
+	}
 }
 
 // Resize changes the terminal grid while preserving overlapping cells.
@@ -120,6 +145,16 @@ func (s *Screen) eraseRow(y, first, last int) {
 	}
 	if last >= s.Width {
 		last = s.Width - 1
+	}
+	if first > last {
+		return
+	}
+	// Do not leave half of a wide glyph outside the erased range.
+	if first > 0 && RuneWidth(s.Cells[y][first-1].Rune) == 2 {
+		s.Cells[y][first-1] = s.blankCell()
+	}
+	if last+1 < s.Width && s.Cells[y][last+1].Rune == 0 && RuneWidth(s.Cells[y][last].Rune) == 2 {
+		s.Cells[y][last+1] = s.blankCell()
 	}
 	for x := first; x <= last; x++ {
 		s.Cells[y][x] = s.blankCell()

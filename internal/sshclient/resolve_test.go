@@ -30,3 +30,28 @@ func TestResolveExecutableRejectsDirectory(t *testing.T) {
 		t.Fatal("ResolveExecutable() accepted a directory")
 	}
 }
+
+func TestResolvePowerShellOverride(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "pwsh.exe")
+	if err := os.WriteFile(file, []byte("test"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ResolvePowerShell(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := filepath.Abs(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("ResolvePowerShell() = %q, want %q", got, want)
+	}
+}
+
+func TestResolvePowerShellRejectsDirectory(t *testing.T) {
+	if _, err := ResolvePowerShell(t.TempDir()); err == nil {
+		t.Fatal("ResolvePowerShell() accepted a directory")
+	}
+}
