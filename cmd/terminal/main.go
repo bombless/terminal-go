@@ -101,6 +101,19 @@ const (
 	enChange         = 0x0300
 	gcsCompStr       = 0x0008
 
+	wmIMEStartComposition = 0x010D
+	wmIMEEndComposition   = 0x010E
+	wmIMEComposition      = 0x010F
+	wmIMERequest          = 0x0288
+	imrQueryCharPosition  = 0x0012
+
+	cfsDefault       = 0x0000
+	cfsRect          = 0x0001
+	cfsPoint         = 0x0002
+	cfsForcePosition = 0x0020
+	cfsCandidatePos  = 0x0040
+	cfsExclude       = 0x0080
+
 	cellWidth     = 10
 	cellHeight    = 20
 	toolbarHeight = 56
@@ -156,6 +169,29 @@ const (
 )
 
 type point struct{ X, Y int32 }
+type rect struct{ Left, Top, Right, Bottom int32 }
+
+type compositionForm struct {
+	dwStyle      uint32
+	ptCurrentPos point
+	rcArea       rect
+}
+
+type candidateForm struct {
+	dwIndex      uint32
+	dwStyle      uint32
+	ptCurrentPos point
+	rcArea       rect
+}
+
+type imeCharPosition struct {
+	dwSize      uint32
+	dwCharPos   uint32
+	pt          point
+	cLineHeight uint32
+	rcDocument  rect
+}
+
 type msg struct {
 	Hwnd           uintptr
 	Message        uint32
@@ -163,7 +199,6 @@ type msg struct {
 	Time           uint32
 	Pt             point
 }
-type rect struct{ Left, Top, Right, Bottom int32 }
 type paintStruct struct {
 	Hdc                uintptr
 	Erase              int32
@@ -387,6 +422,66 @@ func handleVScroll(hwnd uintptr, wParam uintptr) {
 	}
 }
 
+func updateIMECursorPos(hwnd uintptr) {
+	if hwnd == 0 {
+		return
+	}
+	focused, _, _ := winapi.User32.NewProc("GetFocus").Call()
+	if focused != hwnd {
+		return
+	}
+	screenMu.Lock()
+	curX, curY := screen.X, screen.Y
+	offset := scrollOffset
+	height := screen.Height
+	width := screen.Width
+	screenMu.Unlock()
+
+	if width <= 0 || height <= 0 {
+		return
+	}
+	viewCurY := curY + offset
+	if curX >= width {
+		curX = width - 1
+	}
+	if curX < 0 {
+		curX = 0
+	}
+	if viewCurY < 0 {
+		viewCurY = 0
+	} else if viewCurY >= height {
+		viewCurY = height - 1
+	}
+	rc := cursorCellRect(curX, viewCurY)
+
+	winapi.SetCaretPos.Call(uintptr(rc.Left), uintptr(rc.Top))
+
+	hIMC, _, _ := winapi.ImmGetContext.Call(hwnd)
+	if hIMC != 0 {
+		defer winapi.ImmReleaseContext.Call(hwnd, hIMC)
+
+		compForm := compositionForm{
+			dwStyle: cfsPoint,
+			ptCurrentPos: point{
+				X: rc.Left,
+				Y: rc.Top,
+			},
+		}
+		winapi.ImmSetCompositionWindow.Call(hIMC, uintptr(unsafe.Pointer(&compForm)))
+
+		candForm := candidateForm{
+			dwIndex: 0,
+			dwStyle: cfsExclude,
+			ptCurrentPos: point{
+				X: rc.Left,
+				Y: rc.Top,
+			},
+			rcArea: rc,
+		}
+		winapi.ImmSetCandidateWindow.Call(hIMC, uintptr(unsafe.Pointer(&candForm)))
+	}
+}
+
 func invalidateCursor(hwnd uintptr) {
 	screenMu.Lock()
 	curX, curY := screen.X, screen.Y
@@ -406,6 +501,7 @@ func invalidateCursor(hwnd uintptr) {
 		}
 		lastCursorRc = rc
 		winapi.User32.NewProc("InvalidateRect").Call(hwnd, uintptr(unsafe.Pointer(&rc)), 0)
+		updateIMECursorPos(hwnd)
 	} else if lastCursorRc.Right > lastCursorRc.Left {
 		winapi.User32.NewProc("InvalidateRect").Call(hwnd, uintptr(unsafe.Pointer(&lastCursorRc)), 0)
 		lastCursorRc = rect{}
@@ -467,12 +563,66 @@ func windowProc(hwnd uintptr, message uint32, wParam uintptr, lp unsafe.Pointer)
 		telemetryf("window_message wm_create_end host=%d connect=%d disconnect=%d powershell=%d status=%d", hostEdit, connectButton, disconnectButton, powerShellButton, statusLabel)
 		return 0
 	case wmSetFocus:
+		winapi.CreateCaret.Call(hwnd, 0, 1, uintptr(cellHeight))
+		updateIMECursorPos(hwnd)
 		resetCursorBlink(hwnd)
 		return 0
 	case wmKillFocus:
+		winapi.DestroyCaret.Call()
 		cursorBlinkOn = false
 		invalidateCursor(hwnd)
 		return 0
+	case wmIMEStartComposition, wmIMEComposition:
+		updateIMECursorPos(hwnd)
+		r, _, _ := winapi.DefWindowProcW.Call(hwnd, uintptr(message), wParam, lParam)
+		return r
+	case wmIMERequest:
+		if wParam == imrQueryCharPosition && lp != nil {
+			cp := (*imeCharPosition)(lp)
+			screenMu.Lock()
+			curX, curY := screen.X, screen.Y
+			offset := scrollOffset
+			height := screen.Height
+			width := screen.Width
+			screenMu.Unlock()
+
+			if width > 0 && height > 0 {
+				viewCurY := curY + offset
+				if curX >= width {
+					curX = width - 1
+				}
+				if curX < 0 {
+					curX = 0
+				}
+				if viewCurY < 0 {
+					viewCurY = 0
+				} else if viewCurY >= height {
+					viewCurY = height - 1
+				}
+				rc := cursorCellRect(curX, viewCurY)
+				pt := point{X: rc.Left, Y: rc.Top}
+				winapi.ClientToScreen.Call(hwnd, uintptr(unsafe.Pointer(&pt)))
+
+				var clientRc rect
+				winapi.GetClientRect.Call(hwnd, uintptr(unsafe.Pointer(&clientRc)))
+				docPtTopLeft := point{X: clientRc.Left, Y: clientRc.Top}
+				winapi.ClientToScreen.Call(hwnd, uintptr(unsafe.Pointer(&docPtTopLeft)))
+				docPtBottomRight := point{X: clientRc.Right, Y: clientRc.Bottom}
+				winapi.ClientToScreen.Call(hwnd, uintptr(unsafe.Pointer(&docPtBottomRight)))
+
+				cp.pt = pt
+				cp.cLineHeight = uint32(cellHeight)
+				cp.rcDocument = rect{
+					Left:   docPtTopLeft.X,
+					Top:    docPtTopLeft.Y,
+					Right:  docPtBottomRight.X,
+					Bottom: docPtBottomRight.Y,
+				}
+				return 1
+			}
+		}
+		r, _, _ := winapi.DefWindowProcW.Call(hwnd, uintptr(message), wParam, lParam)
+		return r
 	case wmSize:
 		telemetryf("window_message wm_size_begin width=%d height=%d", uint16(lParam), uint16(lParam>>16))
 		layoutToolbar(hwnd, int32(uint16(lParam)), int32(uint16(lParam>>16)))
@@ -1694,6 +1844,7 @@ func paint(hwnd uintptr) {
 			cursorBrush := brushRef(cursorBorder)
 			winapi.FrameRect.Call(hdc, uintptr(unsafe.Pointer(&cursorRc)), cursorBrush)
 			lastCursorRc = cursorRc
+			updateIMECursorPos(hwnd)
 		}
 		if previousFont != 0 {
 			winapi.SelectObject.Call(hdc, previousFont)
@@ -1830,6 +1981,7 @@ func main() {
 	telemetryf("main after_show_window")
 	winapi.User32.NewProc("UpdateWindow").Call(hwnd)
 	telemetryf("main after_update_window")
+	winapi.User32.NewProc("SetFocus").Call(hwnd)
 	var m msg
 	for {
 		r, _, _ := winapi.GetMessageW.Call(uintptr(unsafe.Pointer(&m)), 0, 0, 0)

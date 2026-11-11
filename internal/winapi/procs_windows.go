@@ -52,6 +52,12 @@ var (
 	ImmGetContext            = Imm32.NewProc("ImmGetContext")
 	ImmReleaseContext        = Imm32.NewProc("ImmReleaseContext")
 	ImmGetCompositionStringW = Imm32.NewProc("ImmGetCompositionStringW")
+	ImmSetCompositionWindow  = Imm32.NewProc("ImmSetCompositionWindow")
+	ImmSetCandidateWindow    = Imm32.NewProc("ImmSetCandidateWindow")
+	CreateCaret              = User32.NewProc("CreateCaret")
+	DestroyCaret             = User32.NewProc("DestroyCaret")
+	SetCaretPos              = User32.NewProc("SetCaretPos")
+	ClientToScreen           = User32.NewProc("ClientToScreen")
 	DwmSetWindowAttribute    = Dwmapi.NewProc("DwmSetWindowAttribute")
 
 	// ConPTY and process APIs are exported by Kernel32 on supported Windows versions.
