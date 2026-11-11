@@ -2,12 +2,16 @@ package term
 
 import "unicode/utf8"
 
+const maxAPCBytes = 24 << 20
+
 const (
 	stateGround uint8 = iota
 	stateEscape
 	stateCSI
 	stateOSC
 	stateOSCEscape
+	stateAPC
+	stateAPCEscape
 )
 
 const trueColorFlag uint32 = 1 << 24
@@ -27,6 +31,16 @@ type Parser struct {
 	originMode     bool
 	scrollTop      int
 	scrollBottom   int
+	apc            []byte
+	OnAPC          func(APC)
+}
+
+// APC is a completed Application Program Command. For Kitty graphics, Data
+// contains the control string before ';' and Payload contains encoded bytes.
+type APC struct {
+	Command byte
+	Control string
+	Payload []byte
 }
 
 func NewParser(s *Screen) *Parser {
@@ -72,6 +86,9 @@ func (p *Parser) feedByte(b byte) {
 		p.screen.Put(rune(b))
 	case stateEscape:
 		switch b {
+		case '_':
+			p.apc = p.apc[:0]
+			p.state = stateAPC
 		case '[':
 			p.state, p.params, p.value, p.haveValue, p.private = stateCSI, p.params[:0], 0, false, false
 		case ']':
@@ -131,6 +148,40 @@ func (p *Parser) feedByte(b byte) {
 			p.state = stateGround
 		} else if b != 0x1b {
 			p.state = stateOSC
+		}
+	case stateAPC:
+		if b == 0x1b {
+			p.state = stateAPCEscape
+		} else if len(p.apc) < maxAPCBytes {
+			p.apc = append(p.apc, b)
+		} else {
+			p.apc = p.apc[:0]
+			p.state = stateGround
+		}
+	case stateAPCEscape:
+		if b == '\\' {
+			p.finishAPC()
+			p.state = stateGround
+		} else if len(p.apc)+2 <= maxAPCBytes {
+			p.apc = append(p.apc, 0x1b, b)
+			p.state = stateAPC
+		} else {
+			p.apc = p.apc[:0]
+			p.state = stateGround
+		}
+	}
+}
+
+func (p *Parser) finishAPC() {
+	if len(p.apc) == 0 || p.OnAPC == nil || p.apc[0] != 'G' {
+		return
+	}
+	for i, b := range p.apc {
+		if b == ';' {
+			if i > 0 {
+				p.OnAPC(APC{Command: 'G', Control: string(p.apc[1:i]), Payload: append([]byte(nil), p.apc[i+1:]...)})
+			}
+			return
 		}
 	}
 }

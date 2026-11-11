@@ -8,6 +8,7 @@ import "syscall"
 var (
 	User32                 = syscall.NewLazyDLL("user32.dll")
 	Gdi32                  = syscall.NewLazyDLL("gdi32.dll")
+	Msimg32                = syscall.NewLazyDLL("msimg32.dll")
 	Kernel32               = syscall.NewLazyDLL("kernel32.dll")
 	Ole32                  = syscall.NewLazyDLL("ole32.dll")
 	Imm32                  = syscall.NewLazyDLL("imm32.dll")
@@ -35,6 +36,7 @@ var (
 	FrameRect              = User32.NewProc("FrameRect")
 	CreateCompatibleDC     = Gdi32.NewProc("CreateCompatibleDC")
 	CreateCompatibleBitmap = Gdi32.NewProc("CreateCompatibleBitmap")
+	CreateDIBSection       = Gdi32.NewProc("CreateDIBSection")
 	BitBlt                 = Gdi32.NewProc("BitBlt")
 	DeleteDC               = Gdi32.NewProc("DeleteDC")
 	IntersectClipRect      = Gdi32.NewProc("IntersectClipRect")
@@ -46,6 +48,7 @@ var (
 	DrawTextW              = User32.NewProc("DrawTextW")
 	SetScrollInfo          = User32.NewProc("SetScrollInfo")
 	GetScrollInfo          = User32.NewProc("GetScrollInfo")
+	AlphaBlend             = Msimg32.NewProc("AlphaBlend")
 
 	OleInitialize            = Ole32.NewProc("OleInitialize")
 	OleUninitialize          = Ole32.NewProc("OleUninitialize")
@@ -73,4 +76,5 @@ var (
 	WaitForSingleObject               = Kernel32.NewProc("WaitForSingleObject")
 	CloseHandle                       = Kernel32.NewProc("CloseHandle")
 	TerminateProcess                  = Kernel32.NewProc("TerminateProcess")
+	RtlMoveMemory                     = Kernel32.NewProc("RtlMoveMemory")
 )

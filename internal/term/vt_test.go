@@ -2,6 +2,39 @@ package term
 
 import "testing"
 
+func TestParserKittyAPCSurvivesSplitFeeds(t *testing.T) {
+	s := NewScreen(32, 2)
+	p := NewParser(s)
+	var got []APC
+	p.OnAPC = func(a APC) { got = append(got, a) }
+	p.Feed([]byte("hello\x1b_Ga=T,f=100,i=7;YWJ"))
+	p.Feed([]byte("j\x1b"))
+	p.Feed([]byte("\\world"))
+	if len(got) != 1 {
+		t.Fatalf("APC callbacks = %d, want 1", len(got))
+	}
+	if got[0].Command != 'G' || got[0].Control != "a=T,f=100,i=7" || string(got[0].Payload) != "YWJj" {
+		t.Fatalf("APC = %+v, want Kitty graphics control and payload", got[0])
+	}
+	if line := string([]rune{s.Cells[0][0].Rune, s.Cells[0][1].Rune, s.Cells[0][2].Rune, s.Cells[0][3].Rune, s.Cells[0][4].Rune, s.Cells[0][5].Rune, s.Cells[0][6].Rune, s.Cells[0][7].Rune, s.Cells[0][8].Rune, s.Cells[0][9].Rune, s.Cells[0][10].Rune}); line != "helloworld " {
+		t.Fatalf("APC leaked into terminal text: %q", line)
+	}
+}
+
+func TestParserUnknownAndMalformedAPCAreSwallowed(t *testing.T) {
+	s := NewScreen(20, 2)
+	p := NewParser(s)
+	var got []APC
+	p.OnAPC = func(a APC) { got = append(got, a) }
+	p.Feed([]byte("\x1b_Xunknown\x1b\\\x1b_Ga=T;\x1b\\Z"))
+	if len(got) != 1 || len(got[0].Payload) != 0 {
+		t.Fatalf("APC callbacks = %+v, want one empty-payload graphics APC", got)
+	}
+	if s.Cells[0][0].Rune != 'Z' || s.X != 1 {
+		t.Fatalf("screen after APC = (%q, cursor %d), want Z at 0", s.Cells[0][0].Rune, s.X)
+	}
+}
+
 func TestParserKeepsCSIStateAcrossFeed(t *testing.T) {
 	s := NewScreen(8, 3)
 	p := NewParser(s)

@@ -4,6 +4,7 @@ package main
 
 import (
 	"fmt"
+	"image"
 	"log"
 	"os"
 	"path/filepath"
@@ -18,6 +19,7 @@ import (
 	"unicode/utf8"
 	"unsafe"
 
+	"github.com/bombless/terminal-go/internal/kitty"
 	"github.com/bombless/terminal-go/internal/sshclient"
 	"github.com/bombless/terminal-go/internal/term"
 	"github.com/bombless/terminal-go/internal/winapi"
@@ -234,6 +236,11 @@ type pendingInput struct {
 	data    []byte
 }
 
+type pendingAPC struct {
+	command          term.APC
+	cursorX, cursorY int
+}
+
 type scrollInfo struct {
 	cbSize    uint32
 	fMask     uint32
@@ -250,6 +257,25 @@ type textSelection struct {
 	dragging   bool
 }
 
+type dibInfoHeader struct {
+	Size                         uint32
+	Width, Height                int32
+	Planes, BitCount             uint16
+	Compression, SizeImage       uint32
+	XPelsPerMeter, YPelsPerMeter int32
+	ClrUsed, ClrImportant        uint32
+}
+type bitmapInfo struct {
+	Header dibInfoHeader
+	Colors [1]uint32
+}
+type blendFunction struct{ Op, Flags, SourceConstantAlpha, AlphaFormat byte }
+type cachedImageDIB struct {
+	source               *image.NRGBA
+	dc, bitmap, previous uintptr
+	width, height        int
+}
+
 var (
 	className                                                   = syscall.StringToUTF16Ptr("TerminalGoWindow")
 	windowTitle                                                 = syscall.StringToUTF16Ptr("terminal-go - SSH / PowerShell Terminal")
@@ -260,11 +286,13 @@ var (
 	screenMu                                                    sync.Mutex
 	screen                                                      = term.NewScreen(96, 30)
 	parser                                                      = term.NewParser(screen)
+	graphics                                                    = kitty.NewManager()
 	scrollOffset                                                int // Number of lines scrolled up from bottom (0 = live view)
 	sessionMu                                                   sync.Mutex
 	inputWriteMu                                                sync.Mutex
 	session                                                     *sshclient.Session
 	inputQueue                                                  = make(chan pendingInput, 256)
+	graphicsQueue                                               = make(chan pendingAPC, 2)
 	selection                                                   textSelection
 	cursorBlinkOn                                                      = true
 	cursorBlinkInterval                                         uint32 = 530
@@ -288,6 +316,7 @@ var (
 	backStockBitmap                                             uintptr
 	backW, backH                                                int32
 	brushCache                                                  = make(map[uint32]uintptr)
+	imageDIBCache                                               = make(map[uint32]*cachedImageDIB)
 )
 
 func initTelemetry() {
@@ -916,6 +945,10 @@ func windowProc(hwnd uintptr, message uint32, wParam uintptr, lp unsafe.Pointer)
 		for color, brush := range brushCache {
 			winapi.DeleteObject.Call(brush)
 			delete(brushCache, color)
+		}
+		for id, dib := range imageDIBCache {
+			releaseImageDIB(dib)
+			delete(imageDIBCache, id)
 		}
 		winapi.PostQuitMessage.Call(0)
 		return 0
@@ -1682,6 +1715,90 @@ func brushRef(color uint32) uintptr {
 	return brush
 }
 
+func releaseImageDIB(d *cachedImageDIB) {
+	if d == nil {
+		return
+	}
+	if d.dc != 0 && d.previous != 0 {
+		winapi.SelectObject.Call(d.dc, d.previous)
+	}
+	if d.bitmap != 0 {
+		winapi.DeleteObject.Call(d.bitmap)
+	}
+	if d.dc != 0 {
+		winapi.DeleteDC.Call(d.dc)
+	}
+}
+
+func imageDIB(windowDC uintptr, id uint32, img *image.NRGBA) *cachedImageDIB {
+	if cached := imageDIBCache[id]; cached != nil && cached.source == img {
+		return cached
+	}
+	if old := imageDIBCache[id]; old != nil {
+		releaseImageDIB(old)
+		delete(imageDIBCache, id)
+	}
+	w, h := img.Bounds().Dx(), img.Bounds().Dy()
+	if w <= 0 || h <= 0 || len(img.Pix) != w*h*4 {
+		return nil
+	}
+	dc, _, _ := winapi.CreateCompatibleDC.Call(windowDC)
+	if dc == 0 {
+		return nil
+	}
+	info := bitmapInfo{Header: dibInfoHeader{Size: uint32(unsafe.Sizeof(dibInfoHeader{})), Width: int32(w), Height: -int32(h), Planes: 1, BitCount: 32, Compression: 0, SizeImage: uint32(w * h * 4)}}
+	var bits uintptr
+	bmp, _, _ := winapi.CreateDIBSection.Call(windowDC, uintptr(unsafe.Pointer(&info)), 0, uintptr(unsafe.Pointer(&bits)), 0, 0)
+	if bmp == 0 || bits == 0 {
+		if bmp != 0 {
+			winapi.DeleteObject.Call(bmp)
+		}
+		winapi.DeleteDC.Call(dc)
+		return nil
+	}
+	previous, _, _ := winapi.SelectObject.Call(dc, bmp)
+	pixels := make([]byte, w*h*4)
+	for i := 0; i < w*h; i++ {
+		r, g, b, a := img.Pix[i*4], img.Pix[i*4+1], img.Pix[i*4+2], img.Pix[i*4+3]
+		pixels[i*4] = byte(uint16(b) * uint16(a) / 255)
+		pixels[i*4+1] = byte(uint16(g) * uint16(a) / 255)
+		pixels[i*4+2] = byte(uint16(r) * uint16(a) / 255)
+		pixels[i*4+3] = a
+	}
+	winapi.RtlMoveMemory.Call(bits, uintptr(unsafe.Pointer(&pixels[0])), uintptr(len(pixels)))
+	runtime.KeepAlive(pixels)
+	cached := &cachedImageDIB{source: img, dc: dc, bitmap: bmp, previous: previous, width: w, height: h}
+	imageDIBCache[id] = cached
+	return cached
+}
+
+func drawKittyImages(hdc uintptr, scroll int) {
+	placements, images := graphics.Snapshot()
+	for id, cached := range imageDIBCache {
+		if images[id] == nil {
+			releaseImageDIB(cached)
+			delete(imageDIBCache, id)
+		}
+	}
+	if scroll != 0 {
+		return
+	}
+	blend := blendFunction{Op: 0, SourceConstantAlpha: 255, AlphaFormat: 1}
+	for _, p := range placements {
+		img := images[p.ImageID]
+		if img == nil {
+			continue
+		}
+		dib := imageDIB(hdc, p.ImageID, img)
+		if dib == nil {
+			continue
+		}
+		x := int32(12 + p.X*cellWidth)
+		y := int32(toolbarHeight + 6 + p.Y*cellHeight)
+		winapi.AlphaBlend.Call(hdc, uintptr(x), uintptr(y), uintptr(p.Columns*cellWidth), uintptr(p.Rows*cellHeight), dib.dc, 0, 0, uintptr(dib.width), uintptr(dib.height), uintptr(*(*uint32)(unsafe.Pointer(&blend))))
+	}
+}
+
 func paint(hwnd uintptr) {
 	paintStarted := time.Now()
 	var runs, cells int
@@ -1823,7 +1940,9 @@ func paint(hwnd uintptr) {
 		cursorVisible := screen.CursorVisible
 		viewCurY := curY + scrollOffset
 		isCursorOnScreen := viewCurY >= 0 && viewCurY < screen.Height
+		currentScrollOffset := scrollOffset
 		screenMu.Unlock()
+		drawKittyImages(hdc, currentScrollOffset)
 		sessionMu.Lock()
 		hasSession := session != nil
 		sessionMu.Unlock()
@@ -1920,6 +2039,29 @@ func isIMEComposing(hwnd uintptr) bool {
 
 func init() {
 	runtime.LockOSThread()
+	parser.OnAPC = func(apc term.APC) {
+		item := pendingAPC{command: apc, cursorX: screen.X, cursorY: screen.Y}
+		select {
+		case graphicsQueue <- item:
+		default:
+			telemetryf("graphics_queue_full payload_bytes=%d", len(apc.Payload))
+			writeInput([]byte("\x1b_GEBUSY: graphics queue full\x1b\\"))
+		}
+	}
+}
+
+// graphicsWorker decodes image payloads away from the screen lock and queues
+// protocol replies through the same serialized PTY writer as keyboard input.
+func graphicsWorker() {
+	for item := range graphicsQueue {
+		reply, changed := graphics.Handle(item.command, item.cursorX, item.cursorY)
+		if reply != "" {
+			writeInput([]byte(reply))
+		}
+		if changed && mainHwnd != 0 {
+			winapi.User32.NewProc("InvalidateRect").Call(mainHwnd, 0, 0)
+		}
+	}
 }
 
 // fatal reports startup failures in a dialog because the GUI subsystem has no
@@ -1953,6 +2095,7 @@ func main() {
 	}()
 	telemetryf("main input_writer_start")
 	go inputWriter()
+	go graphicsWorker()
 	telemetryf("main before_get_module_handle")
 	instance, _, _ := winapi.Kernel32.NewProc("GetModuleHandleW").Call(0)
 	telemetryf("main after_get_module_handle instance=%d", instance)
