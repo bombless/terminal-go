@@ -24,9 +24,14 @@ type Parser struct {
 	text           []byte
 	bold           bool
 	savedX, savedY int
+	originMode     bool
+	scrollTop      int
+	scrollBottom   int
 }
 
-func NewParser(s *Screen) *Parser { return &Parser{screen: s} }
+func NewParser(s *Screen) *Parser {
+	return &Parser{screen: s, scrollBottom: s.Height - 1}
+}
 
 func (p *Parser) Feed(data []byte) {
 	for _, b := range data {
@@ -150,9 +155,17 @@ func (p *Parser) execute(final byte) {
 	s := p.screen
 	switch final {
 	case 'A':
-		s.Move(s.X, s.Y-p.param(0, 1))
+		y := s.Y - p.param(0, 1)
+		if p.originMode && y < p.scrollTop {
+			y = p.scrollTop
+		}
+		s.Move(s.X, y)
 	case 'B':
-		s.Move(s.X, s.Y+p.param(0, 1))
+		y := s.Y + p.param(0, 1)
+		if p.originMode && y > p.scrollBottom {
+			y = p.scrollBottom
+		}
+		s.Move(s.X, y)
 	case 'C':
 		s.Move(s.X+p.param(0, 1), s.Y)
 	case 'D':
@@ -164,9 +177,23 @@ func (p *Parser) execute(final byte) {
 	case 'G', '`':
 		s.Move(p.param(0, 1)-1, s.Y)
 	case 'd':
-		s.Move(s.X, p.param(0, 1)-1)
+		y := p.param(0, 1) - 1
+		if p.originMode {
+			y += p.scrollTop
+			if y > p.scrollBottom {
+				y = p.scrollBottom
+			}
+		}
+		s.Move(s.X, y)
 	case 'H', 'f':
-		s.Move(p.param(1, 1)-1, p.param(0, 1)-1)
+		y := p.param(0, 1) - 1
+		if p.originMode {
+			y += p.scrollTop
+			if y > p.scrollBottom {
+				y = p.scrollBottom
+			}
+		}
+		s.Move(p.param(1, 1)-1, y)
 	case 'J':
 		switch p.param(0, 0) {
 		case 0:
@@ -196,6 +223,16 @@ func (p *Parser) execute(final byte) {
 		s.ScrollUp(p.param(0, 1))
 	case 'T':
 		s.ScrollDown(p.param(0, 1))
+	case 'r': // DECSTBM: set scrolling margins (1-based, inclusive).
+		top, bottom := p.param(0, 1)-1, p.param(1, s.Height)-1
+		if top >= 0 && bottom < s.Height && top < bottom {
+			p.scrollTop, p.scrollBottom = top, bottom
+			if p.originMode {
+				s.Move(0, top)
+			} else {
+				s.Move(0, 0)
+			}
+		}
 	case 'm':
 		p.sgr()
 	case 's':
@@ -210,6 +247,9 @@ func (p *Parser) executePrivate(final byte) {
 	case 'h': // DECSET
 		for _, param := range p.params {
 			switch param {
+			case 6:
+				p.originMode = true
+				p.screen.Move(0, p.scrollTop)
 			case 25:
 				p.screen.CursorVisible = true
 			case 47, 1047, 1049:
@@ -219,6 +259,9 @@ func (p *Parser) executePrivate(final byte) {
 	case 'l': // DECRST
 		for _, param := range p.params {
 			switch param {
+			case 6:
+				p.originMode = false
+				p.screen.Move(0, 0)
 			case 25:
 				p.screen.CursorVisible = false
 			case 47, 1047, 1049:

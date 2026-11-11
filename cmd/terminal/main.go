@@ -1595,8 +1595,6 @@ func keySequence(key uintptr) []byte {
 		return []byte("\x1b[5~") // PageUp
 	case 0x22:
 		return []byte("\x1b[6~") // PageDown
-	case 0x1b:
-		return []byte{0x1b}
 	}
 	return nil
 }

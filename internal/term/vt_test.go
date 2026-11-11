@@ -127,6 +127,23 @@ func TestParserDECTCEMCursorVisibility(t *testing.T) {
 	}
 }
 
+func TestParserDECOriginModeUsesScrollingRegion(t *testing.T) {
+	s := NewScreen(10, 8)
+	p := NewParser(s)
+	p.Feed([]byte("\x1b[3;6r\x1b[?6h\x1b[1;1H"))
+	if s.X != 0 || s.Y != 2 {
+		t.Fatalf("origin-mode home = (%d,%d), want (0,2)", s.X, s.Y)
+	}
+	p.Feed([]byte("\x1b[2;4H"))
+	if s.X != 3 || s.Y != 3 {
+		t.Fatalf("origin-mode CUP = (%d,%d), want (3,3)", s.X, s.Y)
+	}
+	p.Feed([]byte("\x1b[?6l\x1b[1;1H"))
+	if s.X != 0 || s.Y != 0 {
+		t.Fatalf("absolute-mode home = (%d,%d), want (0,0)", s.X, s.Y)
+	}
+}
+
 func TestParserScrollAndAltScreen(t *testing.T) {
 	s := NewScreen(4, 2)
 	p := NewParser(s)
