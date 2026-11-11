@@ -7,14 +7,20 @@ type Cell struct {
 	Faint  bool
 }
 
-// Screen stores a fixed-size terminal grid.
+// Screen stores a fixed-size terminal grid with scrollback history.
 type Screen struct {
 	Width, Height int
 	Cells         [][]Cell
+	History       [][]Cell
+	MaxHistory    int
 	X, Y          int
 	FG, BG        uint32
 	Faint         bool
 	CursorVisible bool
+
+	isAlt      bool
+	altCells   [][]Cell
+	altX, altY int
 }
 
 func NewScreen(width, height int) *Screen {
@@ -24,7 +30,14 @@ func NewScreen(width, height int) *Screen {
 	if height < 1 {
 		height = 25
 	}
-	s := &Screen{Width: width, Height: height, FG: 7, BG: 0, CursorVisible: true}
+	s := &Screen{
+		Width:         width,
+		Height:        height,
+		FG:            7,
+		BG:            0,
+		CursorVisible: true,
+		MaxHistory:    10000,
+	}
 	s.Cells = make([][]Cell, height)
 	for y := range s.Cells {
 		s.Cells[y] = make([]Cell, width)
@@ -34,8 +47,11 @@ func NewScreen(width, height int) *Screen {
 	}
 	return s
 }
-func (s *Screen) blankCell() Cell {
+func (s *Screen) BlankCell() Cell {
 	return Cell{Rune: ' ', FG: s.FG, BG: s.BG, Faint: s.Faint}
+}
+func (s *Screen) blankCell() Cell {
+	return s.BlankCell()
 }
 func (s *Screen) Put(r rune) {
 	switch r {
@@ -137,7 +153,159 @@ func (s *Screen) Resize(width, height int) {
 		}
 	}
 	s.Width, s.Height, s.Cells = width, height, cells
+	if s.altCells != nil {
+		altCells := make([][]Cell, height)
+		for y := 0; y < height; y++ {
+			altCells[y] = make([]Cell, width)
+			for x := range altCells[y] {
+				altCells[y][x] = s.blankCell()
+			}
+			if y < len(s.altCells) {
+				copyWidth := width
+				if copyWidth > len(s.altCells[y]) {
+					copyWidth = len(s.altCells[y])
+				}
+				copy(altCells[y], s.altCells[y][:copyWidth])
+			}
+		}
+		s.altCells = altCells
+	}
 	s.Move(s.X, s.Y)
+}
+
+func (s *Screen) TotalLines() int {
+	return len(s.History) + s.Height
+}
+
+func (s *Screen) LineAt(absY int) []Cell {
+	h := len(s.History)
+	if absY < 0 {
+		return nil
+	}
+	if absY < h {
+		return s.History[absY]
+	}
+	cellY := absY - h
+	if cellY < s.Height {
+		return s.Cells[cellY]
+	}
+	return nil
+}
+
+func (s *Screen) CellAt(x, absY int) Cell {
+	line := s.LineAt(absY)
+	if line == nil || x < 0 || x >= len(line) {
+		return s.blankCell()
+	}
+	return line[x]
+}
+
+func (s *Screen) ClearHistory() {
+	s.History = nil
+}
+
+func (s *Screen) IsAlt() bool {
+	return s.isAlt
+}
+
+func (s *Screen) EnterAltScreen() {
+	if s.isAlt {
+		return
+	}
+	s.isAlt = true
+	s.altX, s.altY = s.X, s.Y
+	s.altCells = make([][]Cell, s.Height)
+	for y := range s.altCells {
+		s.altCells[y] = make([]Cell, s.Width)
+		for x := range s.altCells[y] {
+			s.altCells[y][x] = s.blankCell()
+		}
+	}
+	s.Cells, s.altCells = s.altCells, s.Cells
+	s.X, s.Y = 0, 0
+}
+
+func (s *Screen) ExitAltScreen() {
+	if !s.isAlt {
+		return
+	}
+	s.isAlt = false
+	s.Cells, s.altCells = s.altCells, s.Cells
+	s.X, s.Y = s.altX, s.altY
+	s.altCells = nil
+}
+
+func (s *Screen) ScrollUp(n int) {
+	if n <= 0 {
+		n = 1
+	}
+	for i := 0; i < n; i++ {
+		s.scroll()
+	}
+}
+
+func (s *Screen) ScrollDown(n int) {
+	if n <= 0 {
+		n = 1
+	}
+	if n > s.Height {
+		n = s.Height
+	}
+	for y := s.Height - 1; y >= n; y-- {
+		s.Cells[y] = s.Cells[y-n]
+	}
+	for y := 0; y < n; y++ {
+		s.Cells[y] = make([]Cell, s.Width)
+		for x := range s.Cells[y] {
+			s.Cells[y][x] = s.blankCell()
+		}
+	}
+}
+
+func (s *Screen) InsertLines(n int) {
+	if n <= 0 {
+		n = 1
+	}
+	if s.Y < 0 || s.Y >= s.Height {
+		return
+	}
+	for y := s.Height - 1; y >= s.Y+n; y-- {
+		s.Cells[y] = s.Cells[y-n]
+	}
+	for y := s.Y; y < s.Y+n && y < s.Height; y++ {
+		s.Cells[y] = make([]Cell, s.Width)
+		for x := range s.Cells[y] {
+			s.Cells[y][x] = s.blankCell()
+		}
+	}
+}
+
+func (s *Screen) DeleteLines(n int) {
+	if n <= 0 {
+		n = 1
+	}
+	if s.Y < 0 || s.Y >= s.Height {
+		return
+	}
+	for y := s.Y; y < s.Height-n; y++ {
+		s.Cells[y] = s.Cells[y+n]
+	}
+	for y := s.Height - n; y < s.Height; y++ {
+		if y >= s.Y {
+			s.Cells[y] = make([]Cell, s.Width)
+			for x := range s.Cells[y] {
+				s.Cells[y][x] = s.blankCell()
+			}
+		}
+	}
+}
+
+func (s *Screen) ReverseIndex() {
+	if s.Y > 0 {
+		s.Y--
+	} else {
+		s.ScrollDown(1)
+	}
 }
 
 func (s *Screen) eraseRow(y, first, last int) {
@@ -185,6 +353,14 @@ func (s *Screen) eraseDisplayToCursor() {
 	s.eraseRow(s.Y, 0, s.X)
 }
 func (s *Screen) scroll() {
+	if !s.isAlt {
+		saved := make([]Cell, s.Width)
+		copy(saved, s.Cells[0])
+		s.History = append(s.History, saved)
+		if s.MaxHistory > 0 && len(s.History) > s.MaxHistory {
+			s.History = s.History[len(s.History)-s.MaxHistory:]
+		}
+	}
 	copy(s.Cells, s.Cells[1:])
 	row := make([]Cell, s.Width)
 	for x := range row {

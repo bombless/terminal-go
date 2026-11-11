@@ -70,6 +70,27 @@ const (
 	iconResourceID     = 1
 	mbIconError        = 0x0010
 
+	wsVScroll          = 0x00200000
+	sbVert             = 1
+	sifRange           = 0x0001
+	sifPage            = 0x0002
+	sifPos             = 0x0004
+	sifDisablenoscroll = 0x0008
+	sifTrackpos        = 0x0010
+
+	sbLineUp        = 0
+	sbLineDown      = 1
+	sbPageUp        = 2
+	sbPageDown      = 3
+	sbThumbPosition = 4
+	sbThumbTrack    = 5
+	sbTop           = 6
+	sbBottom        = 7
+
+	wmVScroll    = 0x0115
+	wmMouseWheel = 0x020A
+	vkShift      = 0x10
+
 	idHost           = 1001
 	idConnect        = 1002
 	idDisconnect     = 1003
@@ -178,6 +199,16 @@ type pendingInput struct {
 	data    []byte
 }
 
+type scrollInfo struct {
+	cbSize    uint32
+	fMask     uint32
+	nMin      int32
+	nMax      int32
+	nPage     uint32
+	nPos      int32
+	nTrackPos int32
+}
+
 type textSelection struct {
 	start, end int
 	active     bool
@@ -194,6 +225,7 @@ var (
 	screenMu                                                    sync.Mutex
 	screen                                                      = term.NewScreen(96, 30)
 	parser                                                      = term.NewParser(screen)
+	scrollOffset                                                int // Number of lines scrolled up from bottom (0 = live view)
 	sessionMu                                                   sync.Mutex
 	inputWriteMu                                                sync.Mutex
 	session                                                     *sshclient.Session
@@ -260,18 +292,115 @@ func cursorCellRect(curX, curY int) rect {
 	}
 }
 
+func scrollBy(lines int) {
+	screenMu.Lock()
+	newOffset := scrollOffset + lines
+	maxOffset := len(screen.History)
+	if newOffset > maxOffset {
+		newOffset = maxOffset
+	}
+	if newOffset < 0 {
+		newOffset = 0
+	}
+	changed := newOffset != scrollOffset
+	scrollOffset = newOffset
+	screenMu.Unlock()
+	if changed && mainHwnd != 0 {
+		updateScrollBar(mainHwnd)
+		winapi.User32.NewProc("InvalidateRect").Call(mainHwnd, 0, 0)
+	}
+}
+
+func scrollTo(offset int) {
+	screenMu.Lock()
+	maxOffset := len(screen.History)
+	if offset > maxOffset {
+		offset = maxOffset
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	changed := offset != scrollOffset
+	scrollOffset = offset
+	screenMu.Unlock()
+	if changed && mainHwnd != 0 {
+		updateScrollBar(mainHwnd)
+		winapi.User32.NewProc("InvalidateRect").Call(mainHwnd, 0, 0)
+	}
+}
+
+func updateScrollBar(hwnd uintptr) {
+	if hwnd == 0 {
+		return
+	}
+	screenMu.Lock()
+	h := len(screen.History)
+	height := screen.Height
+	offset := scrollOffset
+	screenMu.Unlock()
+
+	totalLines := h + height
+	topLine := h - offset
+	if topLine < 0 {
+		topLine = 0
+	}
+
+	si := scrollInfo{
+		cbSize: uint32(unsafe.Sizeof(scrollInfo{})),
+		fMask:  sifRange | sifPage | sifPos | sifDisablenoscroll,
+		nMin:   0,
+		nMax:   int32(totalLines - 1),
+		nPage:  uint32(height),
+		nPos:   int32(topLine),
+	}
+	winapi.SetScrollInfo.Call(hwnd, sbVert, uintptr(unsafe.Pointer(&si)), 1)
+}
+
+func handleVScroll(hwnd uintptr, wParam uintptr) {
+	screenMu.Lock()
+	h := len(screen.History)
+	height := screen.Height
+	screenMu.Unlock()
+
+	scrollCode := uint16(wParam)
+	switch scrollCode {
+	case sbLineUp:
+		scrollBy(1)
+	case sbLineDown:
+		scrollBy(-1)
+	case sbPageUp:
+		scrollBy(height - 1)
+	case sbPageDown:
+		scrollBy(-(height - 1))
+	case sbThumbTrack, sbThumbPosition:
+		var si scrollInfo
+		si.cbSize = uint32(unsafe.Sizeof(si))
+		si.fMask = sifTrackpos
+		winapi.GetScrollInfo.Call(hwnd, sbVert, uintptr(unsafe.Pointer(&si)))
+		targetTop := int(si.nTrackPos)
+		newOffset := h - targetTop
+		scrollTo(newOffset)
+	case sbTop:
+		scrollTo(h)
+	case sbBottom:
+		scrollTo(0)
+	}
+}
+
 func invalidateCursor(hwnd uintptr) {
 	screenMu.Lock()
 	curX, curY := screen.X, screen.Y
+	offset := scrollOffset
+	height := screen.Height
+	width := screen.Width
 	screenMu.Unlock()
-	if curX >= screen.Width {
-		curX = screen.Width - 1
+
+	viewCurY := curY + offset
+	if curX >= width {
+		curX = width - 1
 	}
-	if curY >= screen.Height {
-		curY = screen.Height - 1
-	}
-	if curX >= 0 && curY >= 0 {
-		rc := cursorCellRect(curX, curY)
+	if curX >= 0 && viewCurY >= 0 && viewCurY < height {
+		rc := cursorCellRect(curX, viewCurY)
 		if lastCursorRc != rc && lastCursorRc.Right > lastCursorRc.Left {
 			winapi.User32.NewProc("InvalidateRect").Call(hwnd, uintptr(unsafe.Pointer(&lastCursorRc)), 0)
 		}
@@ -328,6 +457,13 @@ func windowProc(hwnd uintptr, message uint32, wParam uintptr, lp unsafe.Pointer)
 		cursorBlinkInterval = uint32(blinkTime)
 		winapi.User32.NewProc("SetTimer").Call(hwnd, timerIDCursor, uintptr(cursorBlinkInterval), 0)
 		lastHeartbeat = time.Now()
+		updateScrollBar(hwnd)
+		uxtheme := syscall.NewLazyDLL("uxtheme.dll")
+		setWindowTheme := uxtheme.NewProc("SetWindowTheme")
+		if setWindowTheme.Find() == nil {
+			themeName := syscall.StringToUTF16Ptr("DarkMode_Explorer")
+			setWindowTheme.Call(hwnd, uintptr(unsafe.Pointer(themeName)), 0)
+		}
 		telemetryf("window_message wm_create_end host=%d connect=%d disconnect=%d powershell=%d status=%d", hostEdit, connectButton, disconnectButton, powerShellButton, statusLabel)
 		return 0
 	case wmSetFocus:
@@ -341,7 +477,50 @@ func windowProc(hwnd uintptr, message uint32, wParam uintptr, lp unsafe.Pointer)
 		telemetryf("window_message wm_size_begin width=%d height=%d", uint16(lParam), uint16(lParam>>16))
 		layoutToolbar(hwnd, int32(uint16(lParam)), int32(uint16(lParam>>16)))
 		resizeTerminal(hwnd)
+		updateScrollBar(hwnd)
 		telemetryf("window_message wm_size_end")
+		return 0
+	case wmVScroll:
+		handleVScroll(hwnd, wParam)
+		return 0
+	case wmMouseWheel:
+		delta := int16(uint16(wParam >> 16))
+		screenMu.Lock()
+		isAlt := screen.IsAlt()
+		screenMu.Unlock()
+		if isAlt {
+			var seq []byte
+			lines := int(delta/120) * 3
+			if lines == 0 {
+				if delta > 0 {
+					lines = 1
+				} else if delta < 0 {
+					lines = -1
+				}
+			}
+			if lines > 0 {
+				for i := 0; i < lines; i++ {
+					seq = append(seq, "\x1b[A"...)
+				}
+			} else if lines < 0 {
+				for i := 0; i < -lines; i++ {
+					seq = append(seq, "\x1b[B"...)
+				}
+			}
+			if len(seq) > 0 {
+				writeInput(seq)
+			}
+		} else {
+			lines := int(delta/120) * 3
+			if lines == 0 {
+				if delta > 0 {
+					lines = 1
+				} else if delta < 0 {
+					lines = -1
+				}
+			}
+			scrollBy(lines)
+		}
 		return 0
 	case wmLButtonDown:
 		py := int32(int16(uint16(lParam >> 16)))
@@ -350,15 +529,29 @@ func windowProc(hwnd uintptr, message uint32, wParam uintptr, lp unsafe.Pointer)
 		}
 		winapi.User32.NewProc("SetFocus").Call(hwnd)
 		resetCursorBlink(hwnd)
-		x, y := mouseCell(lParam)
-		selection = textSelection{start: y*screen.Width + x, end: y*screen.Width + x, active: true, dragging: true}
+		x, viewY := mouseCell(lParam)
+		screenMu.Lock()
+		topLine := len(screen.History) - scrollOffset
+		if topLine < 0 {
+			topLine = 0
+		}
+		absY := topLine + viewY
+		selection = textSelection{start: absY*screen.Width + x, end: absY*screen.Width + x, active: true, dragging: true}
+		screenMu.Unlock()
 		winapi.User32.NewProc("SetCapture").Call(hwnd)
 		winapi.User32.NewProc("InvalidateRect").Call(hwnd, 0, 0)
 		return 0
 	case wmMouseMove:
 		if selection.dragging && wParam&mkLButton != 0 {
-			x, y := mouseCell(lParam)
-			selection.end = y*screen.Width + x
+			x, viewY := mouseCell(lParam)
+			screenMu.Lock()
+			topLine := len(screen.History) - scrollOffset
+			if topLine < 0 {
+				topLine = 0
+			}
+			absY := topLine + viewY
+			selection.end = absY*screen.Width + x
+			screenMu.Unlock()
 			winapi.User32.NewProc("InvalidateRect").Call(hwnd, 0, 0)
 		}
 		return 0
@@ -367,9 +560,16 @@ func windowProc(hwnd uintptr, message uint32, wParam uintptr, lp unsafe.Pointer)
 		return 0
 	case wmLButtonUp:
 		if selection.dragging {
-			x, y := mouseCell(lParam)
-			selection.end = y*screen.Width + x
+			x, viewY := mouseCell(lParam)
+			screenMu.Lock()
+			topLine := len(screen.History) - scrollOffset
+			if topLine < 0 {
+				topLine = 0
+			}
+			absY := topLine + viewY
+			selection.end = absY*screen.Width + x
 			selection.dragging = false
+			screenMu.Unlock()
 			winapi.User32.NewProc("ReleaseCapture").Call()
 			winapi.User32.NewProc("InvalidateRect").Call(hwnd, 0, 0)
 		}
@@ -413,6 +613,9 @@ func windowProc(hwnd uintptr, message uint32, wParam uintptr, lp unsafe.Pointer)
 		return r
 	case wmChar:
 		resetCursorBlink(hwnd)
+		if scrollOffset > 0 {
+			scrollTo(0)
+		}
 		if wParam == 3 {
 			if selection.active && selection.start != selection.end {
 				copySelection()
@@ -437,6 +640,33 @@ func windowProc(hwnd uintptr, message uint32, wParam uintptr, lp unsafe.Pointer)
 		return 0
 	case wmKeyDown:
 		resetCursorBlink(hwnd)
+		if keyDown(vkShift) {
+			switch wParam {
+			case 0x21: // PageUp
+				screenMu.Lock()
+				h := screen.Height - 1
+				screenMu.Unlock()
+				scrollBy(h)
+				return 0
+			case 0x22: // PageDown
+				screenMu.Lock()
+				h := screen.Height - 1
+				screenMu.Unlock()
+				scrollBy(-h)
+				return 0
+			case 0x24: // Home
+				screenMu.Lock()
+				h := len(screen.History)
+				screenMu.Unlock()
+				scrollTo(h)
+				return 0
+			case 0x23: // End
+				scrollTo(0)
+				return 0
+			}
+		} else if scrollOffset > 0 && wParam != vkControl && wParam != vkShift && wParam != 0x12 {
+			scrollTo(0)
+		}
 		if keyDown(vkControl) {
 			switch wParam {
 			case 'C':
@@ -551,7 +781,15 @@ func keyDown(key int) bool {
 
 func selectAll(hwnd uintptr) {
 	screenMu.Lock()
-	selection = textSelection{start: 0, end: screen.Width*screen.Height - 1, active: true}
+	topLine := len(screen.History) - scrollOffset
+	if topLine < 0 {
+		topLine = 0
+	}
+	selection = textSelection{
+		start:  topLine * screen.Width,
+		end:    (topLine+screen.Height)*screen.Width - 1,
+		active: true,
+	}
 	screenMu.Unlock()
 	winapi.User32.NewProc("InvalidateRect").Call(hwnd, 0, 0)
 }
@@ -567,14 +805,23 @@ func selectedText() string {
 		first, last = last, first
 	}
 	var out strings.Builder
+	totalLines := screen.TotalLines()
 	for pos := first; pos <= last; pos++ {
-		x, y := pos%screen.Width, pos/screen.Width
-		if y >= screen.Height {
+		x, absY := pos%screen.Width, pos/screen.Width
+		if absY >= totalLines {
 			break
 		}
-		r := screen.Cells[y][x].Rune
+		line := screen.LineAt(absY)
+		var r rune
+		var prevRune rune
+		if line != nil && x < len(line) {
+			r = line[x].Rune
+		}
+		if line != nil && x > 0 && x-1 < len(line) {
+			prevRune = line[x-1].Rune
+		}
 		if r == 0 {
-			if x > 0 && term.RuneWidth(screen.Cells[y][x-1].Rune) == 2 {
+			if x > 0 && term.RuneWidth(prevRune) == 2 {
 				if x == screen.Width-1 && pos < last {
 					out.WriteByte('\n')
 				}
@@ -1031,6 +1278,10 @@ func startSession(hwnd uintptr, label, pendingStatus, connectedStatus, executabl
 	}
 	session = s
 	sessionMu.Unlock()
+	screenMu.Lock()
+	scrollOffset = 0
+	screenMu.Unlock()
+	updateScrollBar(hwnd)
 	setStatus(connectedStatus)
 	updateToolbarState()
 	winapi.User32.NewProc("SetFocus").Call(hwnd)
@@ -1048,7 +1299,15 @@ func readSessionOutput(s *sshclient.Session, hwnd uintptr, label string) {
 		if n > 0 {
 			parseStart := time.Now()
 			screenMu.Lock()
+			prevH := len(screen.History)
 			parser.Feed(buf[:n])
+			added := len(screen.History) - prevH
+			if scrollOffset > 0 && added > 0 {
+				scrollOffset += added
+				if scrollOffset > len(screen.History) {
+					scrollOffset = len(screen.History)
+				}
+			}
 			screenMu.Unlock()
 			cursorBlinkOn = true
 			parseElapsed := time.Since(parseStart)
@@ -1058,6 +1317,7 @@ func readSessionOutput(s *sshclient.Session, hwnd uintptr, label string) {
 			if parseElapsed > parseMax {
 				parseMax = parseElapsed
 			}
+			updateScrollBar(hwnd)
 			winapi.User32.NewProc("InvalidateRect").Call(hwnd, 0, 0)
 			if time.Since(windowStart) >= 5*time.Second {
 				telemetryf("output bytes=%d chunks=%d parse_total=%s parse_max=%s input_queue=%d", windowBytes, windowChunks, parseTotal, parseMax, len(inputQueue))
@@ -1205,9 +1465,13 @@ func resizeTerminal(hwnd uintptr) {
 	screenMu.Lock()
 	if width != screen.Width || height != screen.Height {
 		screen.Resize(width, height)
+		if scrollOffset > len(screen.History) {
+			scrollOffset = len(screen.History)
+		}
 	}
 	cols, rows := screen.Width, screen.Height
 	screenMu.Unlock()
+	updateScrollBar(hwnd)
 	sessionMu.Lock()
 	if session != nil {
 		if err := session.Resize(cols, rows); err != nil {
@@ -1331,17 +1595,36 @@ func paint(hwnd uintptr) {
 			previousFont, _, _ = winapi.SelectObject.Call(hdc, terminalFont)
 		}
 		screenMu.Lock()
+		h := len(screen.History)
+		topLine := h - scrollOffset
+		if topLine < 0 {
+			topLine = 0
+		}
 		for y := 0; y < screen.Height; y++ {
+			absY := topLine + y
+			line := screen.LineAt(absY)
 			for x := 0; x < screen.Width; {
-				cell := screen.Cells[y][x]
-				selected := selection.active && isSelected(y*screen.Width+x)
+				var cell term.Cell
+				if line != nil && x < len(line) {
+					cell = line[x]
+				} else {
+					cell = screen.BlankCell()
+				}
+				pos := absY*screen.Width + x
+				selected := selection.active && isSelected(pos)
 				if selected {
 					cell.BG, cell.FG, cell.Faint = selectionBG, selectionFG, false
 				}
 				end := x + 1
 				for end < screen.Width {
-					next := screen.Cells[y][end]
-					if selection.active && isSelected(y*screen.Width+end) {
+					var next term.Cell
+					if line != nil && end < len(line) {
+						next = line[end]
+					} else {
+						next = screen.BlankCell()
+					}
+					nextPos := absY*screen.Width + end
+					if selection.active && isSelected(nextPos) {
 						next.BG, next.FG, next.Faint = selectionBG, selectionFG, false
 					}
 					if next.FG != cell.FG || next.BG != cell.BG || next.Faint != cell.Faint {
@@ -1356,12 +1639,19 @@ func paint(hwnd uintptr) {
 				winapi.FillRect.Call(hdc, uintptr(unsafe.Pointer(&background)), cellBrush)
 				runs++
 				cells += end - x
-				line := make([]uint16, 0, end-x)
+				lineRun := make([]uint16, 0, end-x)
 				dx := make([]int32, 0, end-x)
 				for i := x; i < end; i++ {
-					r := screen.Cells[y][i].Rune
+					var r rune
+					var prevRune rune
+					if line != nil && i < len(line) {
+						r = line[i].Rune
+					}
+					if line != nil && i > 0 && i-1 < len(line) {
+						prevRune = line[i-1].Rune
+					}
 					if r == 0 {
-						if i > 0 && term.RuneWidth(screen.Cells[y][i-1].Rune) == 2 {
+						if i > 0 && term.RuneWidth(prevRune) == 2 {
 							continue // continuation cell of the preceding wide glyph
 						}
 						r = ' '
@@ -1369,7 +1659,7 @@ func paint(hwnd uintptr) {
 					if r > 0xFFFF {
 						r = '?'
 					}
-					line = append(line, uint16(r))
+					lineRun = append(lineRun, uint16(r))
 					dx = append(dx, int32(cellWidth*term.RuneWidth(r)))
 				}
 				fgColor := colorRef(cell.FG)
@@ -1377,12 +1667,14 @@ func paint(hwnd uintptr) {
 					fgColor = term.DimColorRef(cell.FG)
 				}
 				winapi.SetTextColor.Call(hdc, uintptr(fgColor))
-				drawGlyphRuns(hdc, left, top, &background, line, dx)
+				drawGlyphRuns(hdc, left, top, &background, lineRun, dx)
 				x = end
 			}
 		}
 		curX, curY := screen.X, screen.Y
 		cursorVisible := screen.CursorVisible
+		viewCurY := curY + scrollOffset
+		isCursorOnScreen := viewCurY >= 0 && viewCurY < screen.Height
 		screenMu.Unlock()
 		sessionMu.Lock()
 		hasSession := session != nil
@@ -1393,14 +1685,11 @@ func paint(hwnd uintptr) {
 		if curX >= screen.Width {
 			curX = screen.Width - 1
 		}
-		if curY >= screen.Height {
-			curY = screen.Height - 1
-		}
 
-		showCursor := hasSession && cursorVisible && ((isFocused && cursorBlinkOn) || (!isFocused && true))
-		if showCursor && curX >= 0 && curY >= 0 {
+		showCursor := hasSession && cursorVisible && isCursorOnScreen && ((isFocused && cursorBlinkOn) || (!isFocused && true))
+		if showCursor && curX >= 0 {
 			cLeft := int32(12 + curX*cellWidth)
-			cTop := int32(toolbarHeight + 6 + curY*cellHeight)
+			cTop := int32(toolbarHeight + 6 + int32(viewCurY)*cellHeight)
 			cursorRc := rect{Left: cLeft, Top: cTop, Right: cLeft + cellWidth, Bottom: cTop + cellHeight}
 			cursorBrush := brushRef(cursorBorder)
 			winapi.FrameRect.Call(hdc, uintptr(unsafe.Pointer(&cursorRc)), cursorBrush)
@@ -1530,7 +1819,7 @@ func main() {
 	}
 	telemetryf("main after_register_class")
 	telemetryf("main before_create_window")
-	hwnd, _, e := winapi.CreateWindowExW.Call(0, uintptr(unsafe.Pointer(className)), uintptr(unsafe.Pointer(windowTitle)), wsOverlappedWindow|wsClipChildren|wsVisible, 100, 100, 1100, 720, 0, 0, instance, 0)
+	hwnd, _, e := winapi.CreateWindowExW.Call(0, uintptr(unsafe.Pointer(className)), uintptr(unsafe.Pointer(windowTitle)), wsOverlappedWindow|wsClipChildren|wsVisible|wsVScroll, 100, 100, 1100, 720, 0, 0, instance, 0)
 	if hwnd == 0 {
 		telemetryf("main create_window_failed err=%v", e)
 		fatal("Failed to create window: %v", e)

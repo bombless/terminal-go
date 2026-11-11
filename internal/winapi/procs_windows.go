@@ -44,6 +44,8 @@ var (
 	Ellipse                = Gdi32.NewProc("Ellipse")
 	GetStockObject         = Gdi32.NewProc("GetStockObject")
 	DrawTextW              = User32.NewProc("DrawTextW")
+	SetScrollInfo          = User32.NewProc("SetScrollInfo")
+	GetScrollInfo          = User32.NewProc("GetScrollInfo")
 
 	OleInitialize            = Ole32.NewProc("OleInitialize")
 	OleUninitialize          = Ole32.NewProc("OleUninitialize")

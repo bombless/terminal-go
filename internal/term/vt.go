@@ -85,7 +85,7 @@ func (p *Parser) feedByte(b byte) {
 			p.screen.Put('\n')
 			p.state = stateGround // NEL
 		case 'M':
-			p.screen.Move(p.screen.X, p.screen.Y-1)
+			p.screen.ReverseIndex()
 			p.state = stateGround // RI
 		case '\\':
 			p.state = stateGround
@@ -173,8 +173,11 @@ func (p *Parser) execute(final byte) {
 			s.eraseDisplayFromCursor()
 		case 1:
 			s.eraseDisplayToCursor()
-		case 2, 3:
+		case 2:
 			s.eraseDisplay()
+		case 3:
+			s.eraseDisplay()
+			s.ClearHistory()
 		}
 	case 'K':
 		switch p.param(0, 0) {
@@ -185,6 +188,14 @@ func (p *Parser) execute(final byte) {
 		case 2:
 			s.eraseLine()
 		}
+	case 'L':
+		s.InsertLines(p.param(0, 1))
+	case 'M':
+		s.DeleteLines(p.param(0, 1))
+	case 'S':
+		s.ScrollUp(p.param(0, 1))
+	case 'T':
+		s.ScrollDown(p.param(0, 1))
 	case 'm':
 		p.sgr()
 	case 's':
@@ -198,14 +209,20 @@ func (p *Parser) executePrivate(final byte) {
 	switch final {
 	case 'h': // DECSET
 		for _, param := range p.params {
-			if param == 25 {
+			switch param {
+			case 25:
 				p.screen.CursorVisible = true
+			case 47, 1047, 1049:
+				p.screen.EnterAltScreen()
 			}
 		}
 	case 'l': // DECRST
 		for _, param := range p.params {
-			if param == 25 {
+			switch param {
+			case 25:
 				p.screen.CursorVisible = false
+			case 47, 1047, 1049:
+				p.screen.ExitAltScreen()
 			}
 		}
 	}

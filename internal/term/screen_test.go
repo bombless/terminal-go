@@ -136,3 +136,64 @@ func TestScreenEraseClearsWideHalves(t *testing.T) {
 		t.Fatalf("erase to wide first half left %+v", s.Cells[0][:2])
 	}
 }
+
+func TestScreenScrollbackHistory(t *testing.T) {
+	s := NewScreen(4, 2)
+	s.MaxHistory = 5
+	for _, r := range "12345678abcdefgh" {
+		s.Put(r)
+	}
+	// "1234" row 0 -> pushed to History[0]
+	// "5678" row 1 -> pushed to History[1]
+	// "abcd" is row 0 on screen
+	// "efgh" is row 1 on screen
+	if len(s.History) != 2 {
+		t.Fatalf("history length = %d, want 2", len(s.History))
+	}
+	if got := string([]rune{s.History[0][0].Rune, s.History[0][1].Rune, s.History[0][2].Rune, s.History[0][3].Rune}); got != "1234" {
+		t.Fatalf("history[0] = %q, want 1234", got)
+	}
+	if got := string([]rune{s.History[1][0].Rune, s.History[1][1].Rune, s.History[1][2].Rune, s.History[1][3].Rune}); got != "5678" {
+		t.Fatalf("history[1] = %q, want 5678", got)
+	}
+	if got := string([]rune{s.Cells[0][0].Rune, s.Cells[0][1].Rune, s.Cells[0][2].Rune, s.Cells[0][3].Rune}); got != "abcd" {
+		t.Fatalf("live row 0 = %q, want abcd", got)
+	}
+
+	// Test TotalLines and LineAt
+	if s.TotalLines() != 4 {
+		t.Fatalf("TotalLines = %d, want 4", s.TotalLines())
+	}
+	line0 := s.LineAt(0)
+	if string([]rune{line0[0].Rune, line0[1].Rune}) != "12" {
+		t.Fatalf("LineAt(0) = %q, want 12", string([]rune{line0[0].Rune, line0[1].Rune}))
+	}
+	line2 := s.LineAt(2) // row 0 of screen
+	if string([]rune{line2[0].Rune, line2[1].Rune}) != "ab" {
+		t.Fatalf("LineAt(2) = %q, want ab", string([]rune{line2[0].Rune, line2[1].Rune}))
+	}
+}
+
+func TestScreenAlternateBuffer(t *testing.T) {
+	s := NewScreen(4, 2)
+	for _, r := range "12345678" {
+		s.Put(r)
+	}
+	s.EnterAltScreen()
+	if !s.IsAlt() {
+		t.Fatal("expected IsAlt to be true")
+	}
+	for _, r := range "abcd" {
+		s.Put(r)
+	}
+	if s.Cells[0][0].Rune != 'a' {
+		t.Fatalf("alt screen cell(0,0) = %c, want a", s.Cells[0][0].Rune)
+	}
+	s.ExitAltScreen()
+	if s.IsAlt() {
+		t.Fatal("expected IsAlt to be false")
+	}
+	if s.Cells[0][0].Rune != '1' {
+		t.Fatalf("restored primary cell(0,0) = %c, want 1", s.Cells[0][0].Rune)
+	}
+}

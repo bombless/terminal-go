@@ -126,3 +126,41 @@ func TestParserDECTCEMCursorVisibility(t *testing.T) {
 		t.Fatal("CursorVisible should be true after DECSET 25")
 	}
 }
+
+func TestParserScrollAndAltScreen(t *testing.T) {
+	s := NewScreen(4, 2)
+	p := NewParser(s)
+	p.Feed([]byte("12345678"))
+	// Test CSI S (Scroll Up 1)
+	p.Feed([]byte("\x1b[1S"))
+	if len(s.History) != 1 {
+		t.Fatalf("history len = %d, want 1", len(s.History))
+	}
+	if string([]rune{s.Cells[0][0].Rune, s.Cells[0][1].Rune}) != "56" {
+		t.Fatalf("cell after scroll up = %q, want 56", string([]rune{s.Cells[0][0].Rune, s.Cells[0][1].Rune}))
+	}
+
+	// Test CSI 3 J (Clear scrollback)
+	p.Feed([]byte("\x1b[3J"))
+	if len(s.History) != 0 {
+		t.Fatalf("history after 3J = %d, want 0", len(s.History))
+	}
+
+	// Test DECSET 1049 / DECRST 1049
+	p.Feed([]byte("\x1b[2J\x1b[H"))
+	p.Feed([]byte("ABCD\x1b[?1049h"))
+	if !s.IsAlt() {
+		t.Fatal("expected alternate screen active after ?1049h")
+	}
+	p.Feed([]byte("XYZ"))
+	if s.Cells[0][0].Rune != 'X' {
+		t.Fatalf("alt screen cell = %c, want X", s.Cells[0][0].Rune)
+	}
+	p.Feed([]byte("\x1b[?1049l"))
+	if s.IsAlt() {
+		t.Fatal("expected alternate screen inactive after ?1049l")
+	}
+	if s.Cells[0][0].Rune != 'A' {
+		t.Fatalf("restored cell = %c, want A", s.Cells[0][0].Rune)
+	}
+}
