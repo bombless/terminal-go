@@ -68,6 +68,7 @@ var (
 	ResizePseudoConsole               = Kernel32.NewProc("ResizePseudoConsole")
 	ClosePseudoConsole                = Kernel32.NewProc("ClosePseudoConsole")
 	CreatePipe                        = Kernel32.NewProc("CreatePipe")
+	SetHandleInformation              = Kernel32.NewProc("SetHandleInformation")
 	InitializeProcThreadAttributeList = Kernel32.NewProc("InitializeProcThreadAttributeList")
 	UpdateProcThreadAttribute         = Kernel32.NewProc("UpdateProcThreadAttribute")
 	DeleteProcThreadAttributeList     = Kernel32.NewProc("DeleteProcThreadAttributeList")

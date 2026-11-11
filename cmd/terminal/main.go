@@ -292,7 +292,7 @@ var (
 	inputWriteMu                                                sync.Mutex
 	session                                                     *sshclient.Session
 	inputQueue                                                  = make(chan pendingInput, 256)
-	graphicsQueue                                               = make(chan pendingAPC, 2)
+	graphicsQueue                                               = make(chan pendingAPC, 16)
 	selection                                                   textSelection
 	cursorBlinkOn                                                      = true
 	cursorBlinkInterval                                         uint32 = 530
@@ -1395,6 +1395,10 @@ func hasSession() bool {
 }
 
 func connectSSH(hwnd uintptr) {
+	connectSSHWithCommand(hwnd, "")
+}
+
+func connectSSHWithCommand(hwnd uintptr, remoteCommand string) {
 	if hasSession() {
 		setStatus("Already connected")
 		return
@@ -1423,11 +1427,20 @@ func connectSSH(hwnd uintptr) {
 			cleanHost = host[:lastColon]
 		}
 	}
+	// Force a remote PTY while keeping the local SSH process on raw pipes.
+	sshArgs = append([]string{"-tt"}, sshArgs...)
 	sshArgs = append(sshArgs, cleanHost)
+	if remoteCommand != "" {
+		sshArgs = append(sshArgs, remoteCommand)
+	}
 	startSession(hwnd, "SSH", "Connecting to "+host+"...", "Connected: "+host, executable, sshArgs)
 }
 
 func startPowerShell(hwnd uintptr) {
+	startPowerShellWithCommand(hwnd, "")
+}
+
+func startPowerShellWithCommand(hwnd uintptr, command string) {
 	if hasSession() {
 		setStatus("Already connected")
 		return
@@ -1437,7 +1450,12 @@ func startPowerShell(hwnd uintptr) {
 		setStatus("PowerShell unavailable: " + err.Error())
 		return
 	}
-	startSession(hwnd, "PowerShell", "Starting PowerShell...", "Connected: PowerShell", executable, nil)
+	args := []string{"-NoLogo", "-NoProfile"}
+	if command != "" {
+		// Keep the interactive shell open after the requested command completes.
+		args = append(args, "-NoExit", "-Command", command)
+	}
+	startSession(hwnd, "PowerShell", "Starting PowerShell...", "Connected: PowerShell", executable, args)
 }
 
 // startSession launches one supported child process in ConPTY and installs it
@@ -1447,7 +1465,13 @@ func startSession(hwnd uintptr, label, pendingStatus, connectedStatus, executabl
 	telemetryf("session_start label=%s executable=%s", label, filepath.Base(executable))
 	setStatus(pendingStatus)
 	spawnStarted := time.Now()
-	s, err := sshclient.Start(executable, args, screen.Width, screen.Height)
+	var s *sshclient.Session
+	var err error
+	if label == "SSH" {
+		s, err = sshclient.StartRaw(executable, args)
+	} else {
+		s, err = sshclient.Start(executable, args, screen.Width, screen.Height)
+	}
 	telemetryf("session_spawn label=%s duration=%s err=%v total=%s", label, time.Since(spawnStarted), err, time.Since(started))
 	if err != nil {
 		setStatus(label + " start failed: " + err.Error())
@@ -1470,6 +1494,24 @@ func startSession(hwnd uintptr, label, pendingStatus, connectedStatus, executabl
 	winapi.User32.NewProc("SetFocus").Call(hwnd)
 	resetCursorBlink(hwnd)
 	go readSessionOutput(s, hwnd, label)
+	if s.ErrOutput != nil {
+		go drainSessionStderr(s, label)
+	}
+}
+
+// drainSessionStderr prevents the child's diagnostic pipe from filling while
+// keeping stderr bytes out of the terminal's VT/APC stream.
+func drainSessionStderr(s *sshclient.Session, label string) {
+	buf := make([]byte, 4096)
+	for {
+		n, err := s.ErrOutput.Read(buf)
+		if n > 0 {
+			telemetryf("child_stderr label=%s bytes=%d", label, n)
+		}
+		if err != nil {
+			return
+		}
+	}
 }
 
 func readSessionOutput(s *sshclient.Session, hwnd uintptr, label string) {
@@ -2041,12 +2083,10 @@ func init() {
 	runtime.LockOSThread()
 	parser.OnAPC = func(apc term.APC) {
 		item := pendingAPC{command: apc, cursorX: screen.X, cursorY: screen.Y}
-		select {
-		case graphicsQueue <- item:
-		default:
-			telemetryf("graphics_queue_full payload_bytes=%d", len(apc.Payload))
-			writeInput([]byte("\x1b_GEBUSY: graphics queue full\x1b\\"))
-		}
+		// Backpressure the stdout reader instead of dropping APC chunks. The
+		// worker never takes screenMu, so this bounded send cannot deadlock the
+		// parser and preserves the order of Kitty multipart transfers.
+		graphicsQueue <- item
 	}
 }
 
@@ -2054,9 +2094,12 @@ func init() {
 // protocol replies through the same serialized PTY writer as keyboard input.
 func graphicsWorker() {
 	for item := range graphicsQueue {
+		started := time.Now()
 		reply, changed := graphics.Handle(item.command, item.cursorX, item.cursorY)
+		telemetryf("graphics_worker control=%q payload_bytes=%d reply_bytes=%d changed=%t elapsed=%s queue_remaining=%d", item.command.Control, len(item.command.Payload), len(reply), changed, time.Since(started), len(graphicsQueue))
 		if reply != "" {
 			writeInput([]byte(reply))
+			telemetryf("graphics_reply_enqueued bytes=%d input_queue=%d", len(reply), len(inputQueue))
 		}
 		if changed && mainHwnd != 0 {
 			winapi.User32.NewProc("InvalidateRect").Call(mainHwnd, 0, 0)
@@ -2087,6 +2130,10 @@ func main() {
 	winapi.OleInitialize.Call(0)
 	defer winapi.OleUninitialize.Call()
 	initTelemetry()
+	startup, err := parseStartupOptions(os.Args[1:])
+	if err != nil {
+		fatal("Invalid command-line arguments: %v\n\nUsage: terminal.exe [--ssh user@host[:port] [--ssh-command command] | --powershell [--powershell-command command]]", err)
+	}
 	defer func() {
 		telemetryf("shutdown")
 		if telemetryFile != nil {
@@ -2123,6 +2170,17 @@ func main() {
 	winapi.User32.NewProc("UpdateWindow").Call(hwnd)
 	telemetryf("main after_update_window")
 	winapi.User32.NewProc("SetFocus").Call(hwnd)
+	if startup.sshAddress != "" {
+		hostText, encodeErr := syscall.UTF16PtrFromString(startup.sshAddress)
+		if encodeErr != nil {
+			setStatus("Invalid SSH address: " + encodeErr.Error())
+		} else {
+			winapi.User32.NewProc("SetWindowTextW").Call(hostEdit, uintptr(unsafe.Pointer(hostText)))
+			connectSSHWithCommand(hwnd, startup.sshCommand)
+		}
+	} else if startup.powerShell {
+		startPowerShellWithCommand(hwnd, startup.powerShellCommand)
+	}
 	var m msg
 	for {
 		r, _, _ := winapi.GetMessageW.Call(uintptr(unsafe.Pointer(&m)), 0, 0, 0)

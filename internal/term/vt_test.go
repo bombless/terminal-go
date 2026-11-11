@@ -214,3 +214,30 @@ func TestParserScrollAndAltScreen(t *testing.T) {
 		t.Fatalf("restored cell = %c, want A", s.Cells[0][0].Rune)
 	}
 }
+
+func TestParserMultipleAPCsAndTerminatorSplitAtEveryBoundary(t *testing.T) {
+	s := NewScreen(24, 2)
+	p := NewParser(s)
+	var got []APC
+	p.OnAPC = func(a APC) { got = append(got, a) }
+	first := []byte("\x1b_Ga=q,i=1;\x1b\\")
+	for _, b := range first {
+		p.Feed([]byte{b})
+	}
+	p.Feed([]byte("\x1b_Ga=q,i=2;\x1b\\"))
+	if len(got) != 2 || got[0].Control != "a=q,i=1" || len(got[0].Payload) != 0 || got[1].Control != "a=q,i=2" {
+		t.Fatalf("APCs = %#v, want two independent empty-payload queries", got)
+	}
+	if p.state != stateGround {
+		t.Fatalf("parser state after consecutive APCs = %d, want ground", p.state)
+	}
+}
+
+func TestParserUnknownAPCBetweenTextDoesNotLeak(t *testing.T) {
+	s := NewScreen(8, 2)
+	p := NewParser(s)
+	p.Feed([]byte("A\x1b_unknown;payload\x1b\\B"))
+	if s.Cells[0][0].Rune != 'A' || s.Cells[0][1].Rune != 'B' || s.X != 2 {
+		t.Fatalf("screen after unknown APC = %q%q cursor=%d, want AB cursor=2", s.Cells[0][0].Rune, s.Cells[0][1].Rune, s.X)
+	}
+}

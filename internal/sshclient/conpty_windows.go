@@ -21,6 +21,9 @@ const (
 	waitTimeout                      = 258
 	waitFailed                       = 0xFFFFFFFF
 	infinite                         = 0xFFFFFFFF
+	startfUseStdHandles              = 0x00000100
+	createNoWindow                   = 0x08000000
+	handleFlagInherit                = 0x00000001
 )
 
 // coord is the Win32 COORD structure (two signed 16-bit values).
@@ -63,11 +66,13 @@ type securityAttributes struct {
 // must be drained concurrently with input writes to avoid filling the
 // synchronous pipe.
 type Session struct {
-	console uintptr
-	process syscall.Handle
-	thread  syscall.Handle
-	Input   *os.File
-	Output  *os.File
+	console   uintptr
+	process   syscall.Handle
+	thread    syscall.Handle
+	Input     *os.File
+	Output    *os.File
+	ErrOutput *os.File
+	rawPipes  bool
 }
 
 // allowedExecutable reports whether path names a child process this terminal
@@ -189,6 +194,99 @@ func Start(executable string, args []string, columns, rows int) (*Session, error
 	return &Session{console: console, process: pi.Process, thread: pi.Thread, Input: input, Output: output}, nil
 }
 
+// StartRaw starts ssh.exe with ordinary inherited stdin/stdout/stderr pipes.
+// It avoids ConPTY's terminal-output processing so Kitty APC bytes reach the
+// VT parser unchanged. Callers should pass -tt to request a remote PTY.
+func StartRaw(executable string, args []string) (*Session, error) {
+	if !strings.EqualFold(filepath.Base(executable), "ssh.exe") {
+		return nil, fmt.Errorf("raw-pipe transport is restricted to ssh.exe")
+	}
+	exe16, err := syscall.UTF16PtrFromString(executable)
+	if err != nil {
+		return nil, fmt.Errorf("encode executable path: %w", err)
+	}
+	cmd16, err := syscall.UTF16FromString(CommandLine(executable, args))
+	if err != nil {
+		return nil, fmt.Errorf("encode command line: %w", err)
+	}
+
+	var childStdin, parentStdin, parentStdout, childStdout, parentStderr, childStderr syscall.Handle
+	closeAll := func() {
+		for _, h := range []*syscall.Handle{&childStdin, &parentStdin, &parentStdout, &childStdout, &parentStderr, &childStderr} {
+			closeHandle(h)
+		}
+	}
+	defer closeAll()
+	if err = createInheritablePipe(&childStdin, &parentStdin); err != nil {
+		return nil, fmt.Errorf("create SSH stdin pipe: %w", err)
+	}
+	if err = createInheritablePipe(&parentStdout, &childStdout); err != nil {
+		return nil, fmt.Errorf("create SSH stdout pipe: %w", err)
+	}
+	if err = createInheritablePipe(&parentStderr, &childStderr); err != nil {
+		return nil, fmt.Errorf("create SSH stderr pipe: %w", err)
+	}
+	for _, h := range []syscall.Handle{parentStdin, parentStdout, parentStderr} {
+		if err = setHandleNonInheritable(h); err != nil {
+			return nil, fmt.Errorf("protect parent pipe handle: %w", err)
+		}
+	}
+	si := startupInfo{Cb: uint32(unsafe.Sizeof(startupInfo{})), DwFlags: startfUseStdHandles, HStdInput: childStdin, HStdOutput: childStdout, HStdError: childStderr}
+	var pi processInformation
+	ok, _, callErr := winapi.CreateProcessW.Call(
+		uintptr(unsafe.Pointer(exe16)), uintptr(unsafe.Pointer(&cmd16[0])),
+		0, 0, 1, createNoWindow, 0, 0,
+		uintptr(unsafe.Pointer(&si)), uintptr(unsafe.Pointer(&pi)))
+	runtime.KeepAlive(cmd16)
+	runtime.KeepAlive(exe16)
+	if ok == 0 {
+		return nil, fmt.Errorf("CreateProcessW for ssh.exe (raw pipes) failed: %w", callError(callErr))
+	}
+	closeHandle(&childStdin)
+	closeHandle(&childStdout)
+	closeHandle(&childStderr)
+	input := os.NewFile(uintptr(parentStdin), "ssh-stdin")
+	parentStdin = 0
+	output := os.NewFile(uintptr(parentStdout), "ssh-stdout")
+	parentStdout = 0
+	errOutput := os.NewFile(uintptr(parentStderr), "ssh-stderr")
+	parentStderr = 0
+	if input == nil || output == nil || errOutput == nil {
+		if input != nil {
+			_ = input.Close()
+		}
+		if output != nil {
+			_ = output.Close()
+		}
+		if errOutput != nil {
+			_ = errOutput.Close()
+		}
+		winapi.TerminateProcess.Call(uintptr(pi.Process), 1)
+		winapi.WaitForSingleObject.Call(uintptr(pi.Process), infinite)
+		winapi.CloseHandle.Call(uintptr(pi.Thread))
+		winapi.CloseHandle.Call(uintptr(pi.Process))
+		return nil, fmt.Errorf("wrap SSH raw-pipe handles")
+	}
+	return &Session{process: pi.Process, thread: pi.Thread, Input: input, Output: output, ErrOutput: errOutput, rawPipes: true}, nil
+}
+
+func createInheritablePipe(read, write *syscall.Handle) error {
+	sa := securityAttributes{Length: uint32(unsafe.Sizeof(securityAttributes{})), InheritHandle: 1}
+	ok, _, callErr := winapi.CreatePipe.Call(uintptr(unsafe.Pointer(read)), uintptr(unsafe.Pointer(write)), uintptr(unsafe.Pointer(&sa)), 0)
+	if ok == 0 {
+		return callError(callErr)
+	}
+	return nil
+}
+
+func setHandleNonInheritable(handle syscall.Handle) error {
+	ok, _, callErr := winapi.SetHandleInformation.Call(uintptr(handle), handleFlagInherit, 0)
+	if ok == 0 {
+		return callError(callErr)
+	}
+	return nil
+}
+
 func createPipe(read, write *syscall.Handle) error {
 	ok, _, callErr := winapi.CreatePipe.Call(uintptr(unsafe.Pointer(read)), uintptr(unsafe.Pointer(write)), 0, 0)
 	if ok == 0 {
@@ -213,11 +311,14 @@ func callError(err error) error {
 
 // Resize updates the pseudoconsole dimensions in character cells.
 func (s *Session) Resize(columns, rows int) error {
-	if s == nil || s.console == 0 {
+	if s == nil || (s.console == 0 && !s.rawPipes) {
 		return fmt.Errorf("session is closed")
 	}
 	if columns < 1 || rows < 1 || columns > 32767 || rows > 32767 {
 		return fmt.Errorf("invalid terminal size %dx%d", columns, rows)
+	}
+	if s.rawPipes {
+		return fmt.Errorf("SSH raw-pipe session cannot yet send remote PTY window-size updates")
 	}
 	hr, _, callErr := winapi.ResizePseudoConsole.Call(s.console, uintptr(uint32(columns))|uintptr(uint32(rows))<<16)
 	if int32(hr) < 0 {
@@ -280,6 +381,12 @@ func (s *Session) Close() error {
 			first = err
 		}
 		s.Output = nil
+	}
+	if s.ErrOutput != nil {
+		if err := s.ErrOutput.Close(); err != nil && first == nil {
+			first = err
+		}
+		s.ErrOutput = nil
 	}
 	if s.thread != 0 {
 		winapi.CloseHandle.Call(uintptr(s.thread))
