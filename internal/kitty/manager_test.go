@@ -48,6 +48,84 @@ func TestChunkedPNGTransmitAndDisplay(t *testing.T) {
 	}
 }
 
+func TestParserAnchorsKittyPlacementAndAdvancesCursor(t *testing.T) {
+	screen := term.NewScreen(80, 30)
+	parser := term.NewParser(screen)
+	manager := NewManager()
+	screen.OnScroll = func(lines int) { manager.ShiftPlacements(-lines) }
+	parser.OnAPC = func(command term.APC) {
+		_, _, columns, rows := manager.HandleWithCursor(command, screen.X, screen.Y)
+		screen.AdvanceCursor(columns, rows)
+	}
+
+	// Simulate diagnostics followed by a Kitty placement at row 28, column 1.
+	parser.Feed([]byte("\x1b[28;1H"))
+	stream := append([]byte("\x1b_Ga=T,f=100,i=88,c=4,r=2;"), pngPayload(t)...)
+	stream = append(stream, 0x1b, '\\')
+	parser.Feed(stream)
+
+	placements, images := manager.Snapshot()
+	if len(placements) != 1 || images[88] == nil {
+		t.Fatalf("placements=%+v image=%v", placements, images[88])
+	}
+	if got := placements[0]; got.X != 0 || got.Y != 27 || got.Columns != 4 || got.Rows != 2 {
+		t.Fatalf("placement = %+v, want cursor-anchored (0,27) size 4x2", got)
+	}
+	if screen.X != 4 || screen.Y != 29 {
+		t.Fatalf("cursor = (%d,%d), want (4,29) after default C=0 advance", screen.X, screen.Y)
+	}
+}
+
+func TestPlacementScrollsWithContentAndCursorStaysOnScreen(t *testing.T) {
+	screen := term.NewScreen(104, 30)
+	parser := term.NewParser(screen)
+	manager := NewManager()
+	screen.OnScroll = func(lines int) { manager.ShiftPlacements(-lines) }
+	parser.OnAPC = func(command term.APC) {
+		_, _, columns, rows := manager.HandleWithCursor(command, screen.X, screen.Y)
+		screen.AdvanceCursor(columns, rows)
+	}
+
+	// Reproduce the remote tview layout: cursor at row 27, image 29x22 cells.
+	parser.Feed([]byte("\x1b[28;1H"))
+	stream := append([]byte("\x1b_Ga=T,f=100,i=7,c=29,r=22;"), pngPayload(t)...)
+	stream = append(stream, 0x1b, '\\')
+	parser.Feed(stream)
+
+	placements, _ := manager.Snapshot()
+	if len(placements) != 1 {
+		t.Fatalf("placements = %+v", placements)
+	}
+	if got := placements[0]; got.Y != 7 {
+		t.Fatalf("placement Y = %d, want 7 after 20 lines of scrolling", got.Y)
+	}
+	if len(screen.History) != 20 {
+		t.Fatalf("history lines = %d, want 20", len(screen.History))
+	}
+	if screen.X != 29 || screen.Y != 29 {
+		t.Fatalf("cursor = (%d,%d), want (29,29)", screen.X, screen.Y)
+	}
+}
+
+func TestCursorPolicyOneKeepsCursorInPlace(t *testing.T) {
+	screen := term.NewScreen(80, 30)
+	parser := term.NewParser(screen)
+	manager := NewManager()
+	parser.OnAPC = func(command term.APC) {
+		_, _, columns, rows := manager.HandleWithCursor(command, screen.X, screen.Y)
+		screen.AdvanceCursor(columns, rows)
+	}
+
+	parser.Feed([]byte("\x1b[10;5H"))
+	stream := append([]byte("\x1b_Ga=T,f=100,i=9,C=1,c=4,r=2;"), pngPayload(t)...)
+	stream = append(stream, 0x1b, '\\')
+	parser.Feed(stream)
+
+	if screen.X != 4 || screen.Y != 9 {
+		t.Fatalf("cursor = (%d,%d), want unchanged (4,9) for C=1", screen.X, screen.Y)
+	}
+}
+
 func TestTransmitThenPlaceAndDelete(t *testing.T) {
 	m := NewManager()
 	reply, changed := m.Handle(apc("a=t,f=100,i=9", pngPayload(t)), 0, 0)

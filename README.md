@@ -37,6 +37,26 @@ windres -O coff --target=pe-x86-64 -i terminal.rc -o rsrc_windows_amd64.syso
 
 Run `.\\terminal.exe`, enter `user@host` or `host`, and select **Connect**. OpenSSH handles authentication and host-key verification. Select **PowerShell** to open a local PowerShell 7 session instead. Select **Disconnect** to close the current session. `terminal.exe` is a local build artifact and should not be committed.
 
+### Command-line startup options
+
+The GUI can automatically open a session after startup:
+
+```powershell
+# Connect to an SSH host (an optional :port suffix is supported)
+.\\terminal.exe --ssh user@example.com
+
+# Connect and execute one remote command after login
+.\\terminal.exe --ssh user@example.com --ssh-command "uname -a && whoami"
+
+# Open an interactive local PowerShell 7 session
+.\\terminal.exe --powershell
+
+# Execute a command, then remain in the interactive PowerShell session
+.\\terminal.exe --powershell --powershell-command "Get-Date; Get-Location"
+```
+
+`--ssh` and `--powershell` are mutually exclusive. `--ssh-command` requires `--ssh`; `--powershell-command` requires `--powershell`. Commands are passed as a single argument to OpenSSH or `pwsh.exe`, without invoking a local shell. PowerShell uses `-NoExit` when a startup command is supplied so the session remains interactive after the command finishes.
+
 ## Security and architecture
 
 - Launch only the resolved `ssh.exe` or `pwsh.exe`, attached to a Windows ConPTY instance; never launch `cmd.exe` or arbitrary commands.

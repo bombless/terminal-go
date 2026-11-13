@@ -18,6 +18,11 @@ type Screen struct {
 	Faint         bool
 	CursorVisible bool
 
+	// OnScroll is called after the grid scrolls its contents up by lines rows.
+	// Overlays anchored to grid cells (for example Kitty image placements) must
+	// move up by the same amount.
+	OnScroll func(lines int)
+
 	isAlt      bool
 	altCells   [][]Cell
 	altX, altY int
@@ -117,6 +122,25 @@ func (s *Screen) Move(x, y int) {
 		y = s.Height - 1
 	}
 	s.X, s.Y = x, y
+}
+
+// AdvanceCursor applies the Kitty inline-placement cursor policy: the text
+// cursor moves columns cells right and rows cells down, scrolling when it
+// passes the bottom row.
+func (s *Screen) AdvanceCursor(columns, rows int) {
+	if columns > 0 {
+		s.X += columns
+		if s.X >= s.Width {
+			s.X = s.Width - 1
+		}
+	}
+	for ; rows > 0; rows-- {
+		s.Y++
+		if s.Y >= s.Height {
+			s.scroll()
+			s.Y = s.Height - 1
+		}
+	}
 }
 
 // clearWideAt removes any half of a wide glyph covering (x,y) so overwriting
@@ -367,4 +391,7 @@ func (s *Screen) scroll() {
 		row[x] = s.blankCell()
 	}
 	s.Cells[s.Height-1] = row
+	if s.OnScroll != nil {
+		s.OnScroll(1)
+	}
 }

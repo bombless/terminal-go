@@ -78,6 +78,21 @@ func TestScreenMoveClampsCoordinates(t *testing.T) {
 	}
 }
 
+func TestScreenAdvanceCursorScrollsAndNotifies(t *testing.T) {
+	s := NewScreen(10, 5)
+	s.Put('x')
+	scrolled := 0
+	s.OnScroll = func(lines int) { scrolled += lines }
+	s.Move(0, 3)
+	s.AdvanceCursor(4, 4)
+	if s.X != 4 || s.Y != 4 {
+		t.Fatalf("cursor = (%d,%d), want (4,4)", s.X, s.Y)
+	}
+	if scrolled != 3 || len(s.History) != 3 {
+		t.Fatalf("scrolled=%d history=%d, want 3", scrolled, len(s.History))
+	}
+}
+
 func TestScreenWideRuneOccupiesTwoCells(t *testing.T) {
 	s := NewScreen(8, 2)
 	for _, r := range "目录:" {

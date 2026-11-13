@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 	"unsafe"
 )
 
@@ -72,21 +73,27 @@ func TestConPTYStartsInstalledOpenSSH(t *testing.T) {
 		readDone <- readErr
 	}()
 	exitCode, waitErr := session.Wait()
-	closeErr := session.Close()
 	if waitErr != nil {
 		t.Fatalf("wait for ssh.exe: %v", waitErr)
 	}
+	var readErr error
+	select {
+	case readErr = <-readDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ConPTY output reader did not reach EOF after Wait")
+	}
+	closeErr := session.Close()
 	if closeErr != nil {
 		t.Fatalf("close ConPTY session: %v", closeErr)
 	}
-	if readErr := <-readDone; readErr != nil && !errors.Is(readErr, os.ErrClosed) {
+	if readErr != nil && !errors.Is(readErr, os.ErrClosed) {
 		t.Fatalf("read ConPTY output: %v", readErr)
 	}
 	if exitCode != 0 {
 		t.Fatalf("ssh.exe -V exit code = %d; output: %s", exitCode, output.String())
 	}
-	if output.Len() == 0 {
-		t.Fatal("expected the ConPTY output pipe to receive terminal data")
+	if !strings.Contains(output.String(), "OpenSSH") {
+		t.Fatalf("expected OpenSSH version text in ConPTY output, got %q", output.String())
 	}
 }
 
@@ -107,14 +114,20 @@ func TestConPTYStartsInstalledPowerShell(t *testing.T) {
 		readDone <- readErr
 	}()
 	exitCode, waitErr := session.Wait()
-	closeErr := session.Close()
 	if waitErr != nil {
 		t.Fatalf("wait for pwsh.exe: %v", waitErr)
 	}
+	var readErr error
+	select {
+	case readErr = <-readDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("PowerShell ConPTY output reader did not reach EOF after Wait")
+	}
+	closeErr := session.Close()
 	if closeErr != nil {
 		t.Fatalf("close ConPTY session: %v", closeErr)
 	}
-	if readErr := <-readDone; readErr != nil && !errors.Is(readErr, os.ErrClosed) {
+	if readErr != nil && !errors.Is(readErr, os.ErrClosed) {
 		t.Fatalf("read ConPTY output: %v", readErr)
 	}
 	if exitCode != 0 {

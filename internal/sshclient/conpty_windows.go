@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"unsafe"
 
@@ -66,6 +67,7 @@ type securityAttributes struct {
 // must be drained concurrently with input writes to avoid filling the
 // synchronous pipe.
 type Session struct {
+	consoleMu sync.Mutex
 	console   uintptr
 	process   syscall.Handle
 	thread    syscall.Handle
@@ -73,6 +75,11 @@ type Session struct {
 	Output    *os.File
 	ErrOutput *os.File
 	rawPipes  bool
+
+	waitOnce sync.Once
+	waitDone chan struct{}
+	waitCode uint32
+	waitErr  error
 }
 
 // allowedExecutable reports whether path names a child process this terminal
@@ -158,6 +165,10 @@ func Start(executable string, args []string, columns, rows int) (*Session, error
 
 	si := startupInfoEx{LpAttributeList: attributeList}
 	si.StartupInfo.Cb = uint32(unsafe.Sizeof(si))
+	// Tell CreateProcess to initialize the child's standard handles for the
+	// pseudoconsole. Without this, console applications such as Windows OpenSSH
+	// may retain the parent's redirected handles instead of the ConPTY streams.
+	si.StartupInfo.DwFlags = startfUseStdHandles
 	var pi processInformation
 	ok, _, callErr = winapi.CreateProcessW.Call(
 		uintptr(unsafe.Pointer(exe16)), uintptr(unsafe.Pointer(&cmd16[0])),
@@ -191,7 +202,7 @@ func Start(executable string, args []string, columns, rows int) (*Session, error
 		return nil, fmt.Errorf("wrap ConPTY pipe handles")
 	}
 	consoleOpen = false
-	return &Session{console: console, process: pi.Process, thread: pi.Thread, Input: input, Output: output}, nil
+	return &Session{console: console, process: pi.Process, thread: pi.Thread, Input: input, Output: output, waitDone: make(chan struct{})}, nil
 }
 
 // StartRaw starts ssh.exe with ordinary inherited stdin/stdout/stderr pipes.
@@ -267,7 +278,7 @@ func StartRaw(executable string, args []string) (*Session, error) {
 		winapi.CloseHandle.Call(uintptr(pi.Process))
 		return nil, fmt.Errorf("wrap SSH raw-pipe handles")
 	}
-	return &Session{process: pi.Process, thread: pi.Thread, Input: input, Output: output, ErrOutput: errOutput, rawPipes: true}, nil
+	return &Session{process: pi.Process, thread: pi.Thread, Input: input, Output: output, ErrOutput: errOutput, rawPipes: true, waitDone: make(chan struct{})}, nil
 }
 
 func createInheritablePipe(read, write *syscall.Handle) error {
@@ -309,9 +320,22 @@ func callError(err error) error {
 	return syscall.GetLastError()
 }
 
+// closePseudoConsole is safe to call from the process waiter and Close.
+func (s *Session) closePseudoConsole() {
+	if s == nil {
+		return
+	}
+	s.consoleMu.Lock()
+	if s.console != 0 {
+		winapi.ClosePseudoConsole.Call(s.console)
+		s.console = 0
+	}
+	s.consoleMu.Unlock()
+}
+
 // Resize updates the pseudoconsole dimensions in character cells.
 func (s *Session) Resize(columns, rows int) error {
-	if s == nil || (s.console == 0 && !s.rawPipes) {
+	if s == nil {
 		return fmt.Errorf("session is closed")
 	}
 	if columns < 1 || rows < 1 || columns > 32767 || rows > 32767 {
@@ -320,6 +344,11 @@ func (s *Session) Resize(columns, rows int) error {
 	if s.rawPipes {
 		return fmt.Errorf("SSH raw-pipe session cannot yet send remote PTY window-size updates")
 	}
+	s.consoleMu.Lock()
+	defer s.consoleMu.Unlock()
+	if s.console == 0 {
+		return fmt.Errorf("session is closed")
+	}
 	hr, _, callErr := winapi.ResizePseudoConsole.Call(s.console, uintptr(uint32(columns))|uintptr(uint32(rows))<<16)
 	if int32(hr) < 0 {
 		return fmt.Errorf("ResizePseudoConsole failed (HRESULT 0x%08X): %w", uint32(hr), callError(callErr))
@@ -327,28 +356,40 @@ func (s *Session) Resize(columns, rows int) error {
 	return nil
 }
 
-// Wait blocks until the child process exits and returns its exit code.
+// Wait blocks until the child process exits, closes the pseudoconsole to
+// release its output stream, and returns the child's exit code. The shared
+// waiter lets the output reader and explicit shutdown path wait concurrently.
 func (s *Session) Wait() (uint32, error) {
-	if s == nil || s.process == 0 {
+	if s == nil || s.process == 0 || s.waitDone == nil {
 		return 0, fmt.Errorf("session is closed")
 	}
-	r, _, callErr := winapi.WaitForSingleObject.Call(uintptr(s.process), infinite)
-	if uint32(r) == waitFailed {
-		return 0, fmt.Errorf("wait for child process: %w", callError(callErr))
-	}
-	if uint32(r) != waitObject0 {
-		return 0, fmt.Errorf("unexpected wait result 0x%X", uint32(r))
-	}
-	var code uint32
-	ok, _, callErr := winapi.GetExitCodeProcess.Call(uintptr(s.process), uintptr(unsafe.Pointer(&code)))
-	if ok == 0 {
-		return 0, fmt.Errorf("GetExitCodeProcess: %w", callError(callErr))
-	}
-	return code, nil
+	s.waitOnce.Do(func() {
+		go func() {
+			r, _, callErr := winapi.WaitForSingleObject.Call(uintptr(s.process), infinite)
+			if uint32(r) == waitFailed {
+				s.waitErr = fmt.Errorf("wait for child process: %w", callError(callErr))
+			} else if uint32(r) != waitObject0 {
+				s.waitErr = fmt.Errorf("unexpected wait result 0x%X", uint32(r))
+			} else {
+				ok, _, exitErr := winapi.GetExitCodeProcess.Call(uintptr(s.process), uintptr(unsafe.Pointer(&s.waitCode)))
+				if ok == 0 {
+					s.waitErr = fmt.Errorf("GetExitCodeProcess: %w", callError(exitErr))
+				}
+			}
+			if !s.rawPipes {
+				// ConPTY keeps its output channel alive until HPCON is closed.
+				// Close it only after the child exits so final VT output can drain.
+				s.closePseudoConsole()
+			}
+			close(s.waitDone)
+		}()
+	})
+	<-s.waitDone
+	return s.waitCode, s.waitErr
 }
 
-// Close shuts down the ConPTY session and waits briefly for the child to exit.
-// Callers should stop writing and keep the output reader active during shutdown.
+// Close shuts down the session, waits for the process monitor, then releases
+// the output handles. Keep the output reader active until this method returns.
 func (s *Session) Close() error {
 	if s == nil {
 		return nil
@@ -360,9 +401,10 @@ func (s *Session) Close() error {
 		}
 		s.Input = nil
 	}
-	if s.console != 0 {
-		winapi.ClosePseudoConsole.Call(s.console)
-		s.console = 0
+	if !s.rawPipes {
+		// Closing HPCON terminates an attached child and allows its output pipe
+		// to reach EOF. The process waiter may already have done this.
+		s.closePseudoConsole()
 	}
 	if s.process != 0 {
 		r, _, callErr := winapi.WaitForSingleObject.Call(uintptr(s.process), 5000)
@@ -374,6 +416,11 @@ func (s *Session) Close() error {
 			winapi.WaitForSingleObject.Call(uintptr(s.process), infinite)
 		} else if uint32(r) == waitFailed && first == nil {
 			first = fmt.Errorf("wait for child process shutdown: %w", callError(callErr))
+		}
+		if uint32(r) != waitFailed {
+			if _, err := s.Wait(); err != nil && first == nil {
+				first = err
+			}
 		}
 	}
 	if s.Output != nil {

@@ -234,11 +234,7 @@ type trackMouseEventStruct struct {
 type pendingInput struct {
 	session *sshclient.Session
 	data    []byte
-}
-
-type pendingAPC struct {
-	command          term.APC
-	cursorX, cursorY int
+	flush   chan struct{}
 }
 
 type scrollInfo struct {
@@ -292,7 +288,6 @@ var (
 	inputWriteMu                                                sync.Mutex
 	session                                                     *sshclient.Session
 	inputQueue                                                  = make(chan pendingInput, 256)
-	graphicsQueue                                               = make(chan pendingAPC, 16)
 	selection                                                   textSelection
 	cursorBlinkOn                                                      = true
 	cursorBlinkInterval                                         uint32 = 530
@@ -317,6 +312,7 @@ var (
 	backW, backH                                                int32
 	brushCache                                                  = make(map[uint32]uintptr)
 	imageDIBCache                                               = make(map[uint32]*cachedImageDIB)
+	drawnKittyPlacementLogs                                     = make(map[uint32]bool)
 )
 
 func initTelemetry() {
@@ -1468,7 +1464,19 @@ func startSession(hwnd uintptr, label, pendingStatus, connectedStatus, executabl
 	var s *sshclient.Session
 	var err error
 	if label == "SSH" {
-		s, err = sshclient.StartRaw(executable, args)
+		// Keep raw pipes as the default. ConPTY is an explicitly opt-in PoC because
+		// its terminal host may transform or consume Kitty APC / image sequences.
+		switch strings.ToLower(strings.TrimSpace(os.Getenv("TERMINAL_SSH_TRANSPORT"))) {
+		case "", "raw", "raw-pipe":
+			telemetryf("ssh_transport=raw-pipe")
+			s, err = sshclient.StartRaw(executable, args)
+		case "conpty":
+			cols, rows := screen.Width, screen.Height
+			telemetryf("ssh_transport=conpty initial_cols=%d initial_rows=%d", cols, rows)
+			s, err = sshclient.Start(executable, args, cols, rows)
+		default:
+			err = fmt.Errorf("unsupported TERMINAL_SSH_TRANSPORT %q (use raw or conpty)", os.Getenv("TERMINAL_SSH_TRANSPORT"))
+		}
 	} else {
 		s, err = sshclient.Start(executable, args, screen.Width, screen.Height)
 	}
@@ -1493,6 +1501,13 @@ func startSession(hwnd uintptr, label, pendingStatus, connectedStatus, executabl
 	updateToolbarState()
 	winapi.User32.NewProc("SetFocus").Call(hwnd)
 	resetCursorBlink(hwnd)
+	// The ConPTY output pipe is released only after the child exits and HPCON
+	// is closed. Wait concurrently so the output reader can drain to EOF.
+	go func() {
+		if _, waitErr := s.Wait(); waitErr != nil {
+			telemetryf("session_wait label=%s err=%v", label, waitErr)
+		}
+	}()
 	go readSessionOutput(s, hwnd, label)
 	if s.ErrOutput != nil {
 		go drainSessionStderr(s, label)
@@ -1556,6 +1571,11 @@ func readSessionOutput(s *sshclient.Session, hwnd uintptr, label string) {
 			break
 		}
 	}
+	// All Kitty APCs were handled synchronously while parsing, so only the
+	// serialized input writer still needs to drain before the session closes.
+	inputFlushed := make(chan struct{})
+	inputQueue <- pendingInput{session: s, flush: inputFlushed}
+	<-inputFlushed
 	sessionMu.Lock()
 	current := session == s
 	if current {
@@ -1599,6 +1619,10 @@ func writeInput(data []byte) {
 // inputWriter serializes pipe writes away from the Win32 message loop.
 func inputWriter() {
 	for item := range inputQueue {
+		if item.flush != nil {
+			close(item.flush)
+			continue
+		}
 		itemStarted := time.Now()
 		inputWriteMu.Lock()
 		lockWait := time.Since(itemStarted)
@@ -1613,21 +1637,31 @@ func inputWriter() {
 		data := item.data
 		writeStarted := time.Now()
 		originalBytes := len(data)
+		writtenBytes := 0
+		var writeErr error
 		for len(data) > 0 {
 			n, err := input.Write(data)
+			if n > 0 {
+				writtenBytes += n
+				data = data[n:]
+			}
 			if err != nil {
+				writeErr = err
 				setStatus("Session input failed: " + err.Error())
 				break
 			}
 			if n == 0 {
+				writeErr = fmt.Errorf("zero-byte write")
 				setStatus("Session input pipe closed")
 				break
 			}
-			data = data[n:]
 		}
 		writeElapsed := time.Since(writeStarted)
-		if lockWait > 20*time.Millisecond || writeElapsed > 100*time.Millisecond {
-			telemetryf("input_write bytes=%d lock_wait=%s write_time=%s queue_remaining=%d", originalBytes, lockWait, writeElapsed, len(inputQueue))
+		// Kitty replies are small, so record their actual pipe-write completion
+		// even when the write is fast. This confirms local delivery to ssh.exe's
+		// stdin pipe without logging terminal input or protocol payload contents.
+		if originalBytes <= 64 || writeErr != nil || lockWait > 20*time.Millisecond || writeElapsed > 100*time.Millisecond {
+			telemetryf("input_write requested_bytes=%d written_bytes=%d err=%v lock_wait=%s write_time=%s queue_remaining=%d", originalBytes, writtenBytes, writeErr, lockWait, writeElapsed, len(inputQueue))
 		}
 		inputWriteMu.Unlock()
 	}
@@ -1814,16 +1848,14 @@ func imageDIB(windowDC uintptr, id uint32, img *image.NRGBA) *cachedImageDIB {
 	return cached
 }
 
-func drawKittyImages(hdc uintptr, scroll int) {
+func drawKittyImages(hdc uintptr, scroll int, clientRect, clipRect rect) {
 	placements, images := graphics.Snapshot()
 	for id, cached := range imageDIBCache {
 		if images[id] == nil {
 			releaseImageDIB(cached)
 			delete(imageDIBCache, id)
+			delete(drawnKittyPlacementLogs, id)
 		}
-	}
-	if scroll != 0 {
-		return
 	}
 	blend := blendFunction{Op: 0, SourceConstantAlpha: 255, AlphaFormat: 1}
 	for _, p := range placements {
@@ -1836,8 +1868,13 @@ func drawKittyImages(hdc uintptr, scroll int) {
 			continue
 		}
 		x := int32(12 + p.X*cellWidth)
-		y := int32(toolbarHeight + 6 + p.Y*cellHeight)
-		winapi.AlphaBlend.Call(hdc, uintptr(x), uintptr(y), uintptr(p.Columns*cellWidth), uintptr(p.Rows*cellHeight), dib.dc, 0, 0, uintptr(dib.width), uintptr(dib.height), uintptr(*(*uint32)(unsafe.Pointer(&blend))))
+		y := int32(toolbarHeight + 6 + (p.Y+scroll)*cellHeight)
+		dst := rect{Left: x, Top: y, Right: x + int32(p.Columns*cellWidth), Bottom: y + int32(p.Rows*cellHeight)}
+		blendResult, _, blendErr := winapi.AlphaBlend.Call(hdc, uintptr(x), uintptr(y), uintptr(p.Columns*cellWidth), uintptr(p.Rows*cellHeight), dib.dc, 0, 0, uintptr(dib.width), uintptr(dib.height), uintptr(*(*uint32)(unsafe.Pointer(&blend))))
+		if !drawnKittyPlacementLogs[p.ImageID] {
+			drawnKittyPlacementLogs[p.ImageID] = true
+			telemetryf("kitty_draw image_id=%d placement_cell=%d,%d size_cells=%dx%d pixel_rect=%d,%d,%d,%d client_rect=%d,%d,%d,%d clip_rect=%d,%d,%d,%d toolbar_height=%d cell_pixels=%dx%d scroll=%d alpha_blend_ok=%t alpha_blend_err=%v", p.ImageID, p.X, p.Y, p.Columns, p.Rows, dst.Left, dst.Top, dst.Right, dst.Bottom, clientRect.Left, clientRect.Top, clientRect.Right, clientRect.Bottom, clipRect.Left, clipRect.Top, clipRect.Right, clipRect.Bottom, toolbarHeight, cellWidth, cellHeight, scroll, blendResult != 0, blendErr)
+		}
 	}
 }
 
@@ -1984,7 +2021,7 @@ func paint(hwnd uintptr) {
 		isCursorOnScreen := viewCurY >= 0 && viewCurY < screen.Height
 		currentScrollOffset := scrollOffset
 		screenMu.Unlock()
-		drawKittyImages(hdc, currentScrollOffset)
+		drawKittyImages(hdc, currentScrollOffset, rc, clip)
 		sessionMu.Lock()
 		hasSession := session != nil
 		sessionMu.Unlock()
@@ -2081,28 +2118,34 @@ func isIMEComposing(hwnd uintptr) bool {
 
 func init() {
 	runtime.LockOSThread()
-	parser.OnAPC = func(apc term.APC) {
-		item := pendingAPC{command: apc, cursorX: screen.X, cursorY: screen.Y}
-		// Backpressure the stdout reader instead of dropping APC chunks. The
-		// worker never takes screenMu, so this bounded send cannot deadlock the
-		// parser and preserves the order of Kitty multipart transfers.
-		graphicsQueue <- item
+	screen.OnScroll = func(lines int) {
+		graphics.ShiftPlacements(-lines)
 	}
-}
-
-// graphicsWorker decodes image payloads away from the screen lock and queues
-// protocol replies through the same serialized PTY writer as keyboard input.
-func graphicsWorker() {
-	for item := range graphicsQueue {
-		started := time.Now()
-		reply, changed := graphics.Handle(item.command, item.cursorX, item.cursorY)
-		telemetryf("graphics_worker control=%q payload_bytes=%d reply_bytes=%d changed=%t elapsed=%s queue_remaining=%d", item.command.Control, len(item.command.Payload), len(reply), changed, time.Since(started), len(graphicsQueue))
+	// APC handling is synchronous with the stdout stream so an inline image
+	// advances the text cursor before any following text is parsed. The reader
+	// holds screenMu while feeding the parser.
+	parser.OnAPC = func(apc term.APC) {
+		cursorX, cursorY := screen.X, screen.Y
+		reply, changed, cursorColumns, cursorRows := graphics.HandleWithCursor(apc, cursorX, cursorY)
+		telemetryf("kitty_apc control=%q payload_bytes=%d reply_bytes=%d changed=%t cursor_cell=%d,%d advance=%d,%d parser_grid=%dx%d", apc.Control, len(apc.Payload), len(reply), changed, cursorX, cursorY, cursorColumns, cursorRows, screen.Width, screen.Height)
+		if changed {
+			placements, images := graphics.Snapshot()
+			for _, placement := range placements {
+				if placement.X == cursorX && placement.Y == cursorY {
+					img := images[placement.ImageID]
+					if img != nil {
+						telemetryf("kitty_placement_created image_id=%d placement_cell=%d,%d size_cells=%dx%d image_pixels=%dx%d", placement.ImageID, placement.X, placement.Y, placement.Columns, placement.Rows, img.Bounds().Dx(), img.Bounds().Dy())
+					}
+				}
+			}
+		}
+		if cursorColumns > 0 || cursorRows > 0 {
+			screen.AdvanceCursor(cursorColumns, cursorRows)
+			telemetryf("kitty_cursor_advance columns=%d rows=%d cursor_cell=%d,%d history_lines=%d", cursorColumns, cursorRows, screen.X, screen.Y, len(screen.History))
+		}
 		if reply != "" {
 			writeInput([]byte(reply))
-			telemetryf("graphics_reply_enqueued bytes=%d input_queue=%d", len(reply), len(inputQueue))
-		}
-		if changed && mainHwnd != 0 {
-			winapi.User32.NewProc("InvalidateRect").Call(mainHwnd, 0, 0)
+			telemetryf("kitty_reply_enqueued bytes=%d input_queue=%d", len(reply), len(inputQueue))
 		}
 	}
 }
@@ -2142,7 +2185,6 @@ func main() {
 	}()
 	telemetryf("main input_writer_start")
 	go inputWriter()
-	go graphicsWorker()
 	telemetryf("main before_get_module_handle")
 	instance, _, _ := winapi.Kernel32.NewProc("GetModuleHandleW").Call(0)
 	telemetryf("main after_get_module_handle instance=%d", instance)

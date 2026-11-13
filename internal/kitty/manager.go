@@ -6,7 +6,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"image"
-	"image/color"
+	"image/draw"
 	"image/png"
 	"math"
 	"strconv"
@@ -50,12 +50,32 @@ func NewManager() *Manager { return &Manager{images: make(map[uint32]*image.NRGB
 // Handle consumes one complete Kitty APC. Cursor coordinates are sampled at
 // completion, including for chunked transfers.
 func (m *Manager) Handle(apc term.APC, cursorX, cursorY int) (string, bool) {
+	r := m.handle(apc, cursorX, cursorY)
+	return r.reply, r.changed
+}
+
+// HandleWithCursor is Handle plus the cursor movement Kitty applies after an
+// inline placement. Unless the client sets C=1, the text cursor advances right
+// by the placement columns and down by its rows.
+func (m *Manager) HandleWithCursor(apc term.APC, cursorX, cursorY int) (reply string, changed bool, cursorColumns, cursorRows int) {
+	r := m.handle(apc, cursorX, cursorY)
+	return r.reply, r.changed, r.cursorColumns, r.cursorRows
+}
+
+type outcome struct {
+	reply         string
+	changed       bool
+	cursorColumns int
+	cursorRows    int
+}
+
+func (m *Manager) handle(apc term.APC, cursorX, cursorY int) outcome {
 	if apc.Command != 'G' {
-		return "", false
+		return outcome{}
 	}
 	p, err := parseParams(apc.Control)
 	if err != nil {
-		return response(0, "EINVAL: "+err.Error()), false
+		return outcome{reply: response(0, "EINVAL: "+err.Error())}
 	}
 	action := p["a"]
 	if action == "" {
@@ -63,23 +83,27 @@ func (m *Manager) Handle(apc term.APC, cursorX, cursorY int) (string, bool) {
 	}
 	quiet := p["q"]
 	if quiet != "" && quiet != "0" && quiet != "1" && quiet != "2" {
-		return response(0, "EINVAL: invalid response suppression"), false
+		return outcome{reply: response(0, "EINVAL: invalid response suppression")}
 	}
 	id, err := uintParam(p, "i", 0)
 	if err != nil {
-		return maybeResponse(quiet, 0, "EINVAL: invalid image id"), false
+		return outcome{reply: maybeResponse(quiet, 0, "EINVAL: invalid image id")}
+	}
+	cursorPolicy, err := uintParam(p, "C", 0)
+	if err != nil || cursorPolicy > 1 {
+		return outcome{reply: maybeResponse(quiet, id, "EINVAL: invalid cursor policy")}
 	}
 	if medium := p["t"]; medium != "" && medium != "d" {
-		return maybeResponse(quiet, id, "ENOTSUP: transmission medium"), false
+		return outcome{reply: maybeResponse(quiet, id, "ENOTSUP: transmission medium")}
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	switch action {
 	case "q":
 		if p["e"] != "" {
-			return maybeResponse(quiet, id, "EINVAL: feature query unsupported"), false
+			return outcome{reply: maybeResponse(quiet, id, "EINVAL: feature query unsupported")}
 		}
-		return maybeResponse(quiet, id, "OK"), false
+		return outcome{reply: maybeResponse(quiet, id, "OK")}
 	case "d":
 		if id == 0 {
 			m.images = make(map[uint32]*image.NRGBA)
@@ -92,20 +116,25 @@ func (m *Manager) Handle(apc term.APC, cursorX, cursorY int) (string, bool) {
 			}
 			m.removePlacements(id)
 		}
-		return maybeResponse(quiet, id, "OK"), true
+		return outcome{reply: maybeResponse(quiet, id, "OK"), changed: true}
 	case "p":
 		img := m.images[id]
 		if img == nil {
-			return maybeResponse(quiet, id, "ENOENT: image not found"), false
+			return outcome{reply: maybeResponse(quiet, id, "ENOENT: image not found")}
 		}
 		if len(m.placements) >= maxPlacements {
-			return maybeResponse(quiet, id, "E2BIG: placement limit"), false
+			return outcome{reply: maybeResponse(quiet, id, "E2BIG: placement limit")}
 		}
-		m.placements = append(m.placements, m.makePlacement(id, img, p, cursorX, cursorY))
-		return maybeResponse(quiet, id, "OK"), true
+		placement := m.makePlacement(id, img, p, cursorX, cursorY)
+		m.placements = append(m.placements, placement)
+		out := outcome{reply: maybeResponse(quiet, id, "OK"), changed: true}
+		if cursorPolicy == 0 {
+			out.cursorColumns, out.cursorRows = placement.Columns, placement.Rows
+		}
+		return out
 	case "t", "T":
 		if p["o"] != "" {
-			return maybeResponse(quiet, id, "ENOTSUP: compression"), false
+			return outcome{reply: maybeResponse(quiet, id, "ENOTSUP: compression")}
 		}
 		if id == 0 {
 			id = m.allocateID()
@@ -113,40 +142,44 @@ func (m *Manager) Handle(apc term.APC, cursorX, cursorY int) (string, bool) {
 		more, e := uintParam(p, "m", 0)
 		if e != nil || more > 1 {
 			m.pending = nil
-			return maybeResponse(quiet, id, "EINVAL: invalid chunk flag"), false
+			return outcome{reply: maybeResponse(quiet, id, "EINVAL: invalid chunk flag")}
 		}
 		if m.pending == nil {
 			m.pending = &transfer{params: p, data: make([]byte, 0, len(apc.Payload)), id: id, action: action, quiet: quiet}
 		} else if len(p) > 2 {
 			m.pending = nil
-			return maybeResponse(quiet, id, "EINVAL: unexpected parameters in continuation"), false
+			return outcome{reply: maybeResponse(quiet, id, "EINVAL: unexpected parameters in continuation")}
 		}
 		if len(m.pending.data)+len(apc.Payload) > maxEncodedBytes {
 			m.pending = nil
-			return maybeResponse(quiet, id, "E2BIG: image transfer limit"), false
+			return outcome{reply: maybeResponse(quiet, id, "E2BIG: image transfer limit")}
 		}
 		m.pending.data = append(m.pending.data, apc.Payload...)
 		if more == 1 {
-			return "", false
+			return outcome{}
 		}
 		t := m.pending
 		m.pending = nil
 		id, action, quiet = t.id, t.action, t.quiet
 		imageID, decodeErr := m.decodeTransfer(id, t)
 		if decodeErr != nil {
-			return maybeResponse(quiet, id, "EINVAL: "+decodeErr.Error()), false
+			return outcome{reply: maybeResponse(quiet, id, "EINVAL: "+decodeErr.Error())}
 		}
-		changed := false
 		if action == "T" {
 			if len(m.placements) >= maxPlacements {
-				return maybeResponse(quiet, imageID, "E2BIG: placement limit"), false
+				return outcome{reply: maybeResponse(quiet, imageID, "E2BIG: placement limit")}
 			}
-			m.placements = append(m.placements, m.makePlacement(imageID, m.images[imageID], t.params, cursorX, cursorY))
-			changed = true
+			placement := m.makePlacement(imageID, m.images[imageID], t.params, cursorX, cursorY)
+			m.placements = append(m.placements, placement)
+			out := outcome{reply: maybeResponse(quiet, imageID, "OK"), changed: true}
+			if policy, _ := uintParam(t.params, "C", 0); policy == 0 {
+				out.cursorColumns, out.cursorRows = placement.Columns, placement.Rows
+			}
+			return out
 		}
-		return maybeResponse(quiet, imageID, "OK"), changed
+		return outcome{reply: maybeResponse(quiet, imageID, "OK")}
 	default:
-		return maybeResponse(quiet, id, "ENOTSUP: action"), false
+		return outcome{reply: maybeResponse(quiet, id, "ENOTSUP: action")}
 	}
 }
 
@@ -205,11 +238,11 @@ func (m *Manager) decodeTransfer(id uint32, t *transfer) (uint32, error) {
 		return id, fmt.Errorf("image dimensions exceed limits")
 	}
 	rgba := image.NewNRGBA(image.Rect(0, 0, b.Dx(), b.Dy()))
-	for y := 0; y < b.Dy(); y++ {
-		for x := 0; x < b.Dx(); x++ {
-			rgba.SetNRGBA(x, y, color.NRGBAModel.Convert(src.At(b.Min.X+x, b.Min.Y+y)).(color.NRGBA))
-		}
-	}
+	// draw.Draw has optimized paths for common PNG decoder output types
+	// (*image.NRGBA and *image.RGBA). Avoid the per-pixel interface/color-model
+	// conversion loop here: the final Kitty ACK is time-sensitive, and the
+	// transfer should be acknowledged as soon as the image is fully validated.
+	draw.Draw(rgba, rgba.Bounds(), src, b.Min, draw.Src)
 	oldBytes := 0
 	if old := m.images[id]; old != nil {
 		oldBytes = len(old.Pix)
@@ -234,6 +267,20 @@ func (m *Manager) makePlacement(id uint32, img *image.NRGBA, p map[string]string
 	}
 	return Placement{ImageID: id, X: x, Y: y, Columns: int(c), Rows: int(r)}
 }
+
+// ShiftPlacements moves every placement by dy grid rows. A negative dy follows
+// content that has scrolled out of the top of the live grid.
+func (m *Manager) ShiftPlacements(dy int) {
+	if dy == 0 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.placements {
+		m.placements[i].Y += dy
+	}
+}
+
 func (m *Manager) removePlacements(id uint32) {
 	out := m.placements[:0]
 	for _, p := range m.placements {
